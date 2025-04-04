@@ -56,7 +56,6 @@ class Visualizer
 
     public void VisualizeActivations(Stack<(Port, Port)> activations)
     {
-
         var acts = activations.ToArray();
         foreach((var a, _) in acts.Reverse())
             DrawPortCell(a, 0f);
@@ -160,10 +159,8 @@ class Application
         //     nil(Port.FromExtVal(99), 3);
         // });
         var prog = Compiler.CompileExpr(
-            Expr.Add(
-                Expr.If(Expr.I32(0), Expr.I32(0), Expr.I32(1)),
-                Expr.If(Expr.I32(1), Expr.I32(1), Expr.I32(0))
-                ));
+            Expr.Let("x", Expr.I32(3),
+                Expr.Add(Expr.Var("x"), Expr.Add(Expr.Var("x"), Expr.Var("x")))));
 
         Console.WriteLine(prog);
 
