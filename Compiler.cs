@@ -9,6 +9,10 @@ public abstract class Expr
     public static BinExpr Add(Expr l, Expr r) => new (BinOp.Add, l, r);
     public static IfExpr If(Expr c, Expr t, Expr e) => new (c, t, e);
     public static LetExpr Let(string n, Expr x, Expr body) => new (n, x, body);
+    public static DoExpr Do(params Expr[] es) => new (es);
+
+    public static PrintExpr Print(Expr io, Expr val) => new(io, val);
+    // public static InlineExpr Inline(Func<Reg[], Inst[]> insts, params Expr[] es) => new bool(insts, es);
 }
 
 public sealed class Lit(int v) : Expr
@@ -42,6 +46,17 @@ public sealed class LetExpr(string var, Expr x, Expr body) : Expr
     public readonly string Var = var;
     public readonly Expr Val = x;
     public readonly Expr Body = body;
+}
+
+public sealed class DoExpr(Expr[] es) : Expr
+{
+    public readonly Expr[] Exprs = es;
+}
+
+public sealed class PrintExpr(Expr io, Expr val) : Expr
+{
+    public readonly Expr Io = io;
+    public readonly Expr Val = val;
 }
 
 class Slot
@@ -103,25 +118,24 @@ public class Compiler
     private const ushort Fn = 0;
     private const ushort Dup0 = 0x10;
 
-    private const ushort TEMP_PRINT = 1;
+    private const ushort TEMP_PRINT = 2;
 
     Reg Gen() => new Reg(_nextReg++);
 
     public static Program CompileExpr(Expr e)
     {
         var c = new Compiler();
-        var r = c.Gen();
-        c.Compile(e, r);
-        return c.Finish(r);
+        return c.Finish(e);
     }
 
-    Program Finish(Reg exprVal)
+    Program Finish(Expr e)
     {
-        // Wrap the expression in a lambda that calls print on the result:
-        var ioArg = Gen();
+        var ioArg = _scope.Define("io");
         var retVal = Gen();
-        _instructions.Add(new BinaryInst(PortKind.Comb, Fn, _root, ioArg, retVal));
-        _instructions.Add(new BinaryInst(PortKind.ExtFn, TEMP_PRINT, ioArg, exprVal, retVal));
+        Compile(e, retVal);
+        // Wrap the expression in a lambda that calls print on the result:
+        var ioVal = MaterializeUsers(ioArg);
+        _instructions.Add(new BinaryInst(PortKind.Comb, Fn, _root, ioVal, retVal));
 
         return new Program
         {
@@ -130,9 +144,36 @@ public class Compiler
         };
     }
 
-    public void Dup(Reg x, Reg x0, Reg x1)
+    void Dup(Reg x, Reg x0, Reg x1)
     {
         _instructions.Add(new BinaryInst(PortKind.Comb, (ushort)(Dup0 + _dupCount++), x, x0, x1));
+    }
+
+    Reg MaterializeUsers(Slot slot)
+    {
+        // Exactly one user, so just link directly
+        if(slot.Users.Count == 1)
+            return slot.Users.Pop();
+
+        var src = Gen();
+        if (slot.Users.Count > 1)
+        {
+            var from = src;
+            // More than one user, so we need to duplicate the value
+            while (slot.Users.Count > 0)
+            {
+                var user = slot.Users.Pop();
+                var newFrom = slot.Users.Count == 1 ? slot.Users.Pop() : Gen();
+                Dup(from, user, newFrom);
+                from = newFrom;
+            }
+
+            return src;
+        }
+
+        // Variable is not used, so erase it
+        _instructions.Add(new NilaryInst(src, Port.Eraser()));
+        return src;
     }
 
     void Compile(Expr e, Reg res)
@@ -188,33 +229,42 @@ public class Compiler
         {
             var varSlot = _scope.Define(let.Var);
             Compile(let.Body, res);
+            Compile(let.Val, MaterializeUsers(varSlot));
+            return;
+        }
 
-            if (varSlot.Users.Count == 0)
+        if (e is DoExpr doe)
+        {
+            if (doe.Exprs.Length == 0)
             {
-                // Variable is not used, so erase it
-                var varOrigin = Gen();
-                Compile(let.Val, varOrigin);
-                _instructions.Add(new NilaryInst(varOrigin, Port.Eraser()));
-            } else if (varSlot.Users.Count > 1)
+                _instructions.Add(new NilaryInst(res, Port.FromExtVal(ExtVal.FromImm(0))));
+            } else if (doe.Exprs.Length == 1)
             {
-                // More than one user, so we need to duplicate the value
-                var src = Gen();
-                Compile(let.Val, src);
-
-                while (varSlot.Users.Count > 0)
-                {
-                    var user = varSlot.Users.Pop();
-                    var newSrc = varSlot.Users.Count == 1 ? varSlot.Users.Pop() : Gen();
-                    Dup(src, user, newSrc);
-                    src = newSrc;
-                }
+                Compile(doe.Exprs[0], res);
             }
             else
             {
-                // Exactly one user, so just link directly
-                Compile(let.Val, varSlot.Users.Pop());
+                var prevStep = Gen();
+                Compile(doe.Exprs[0], prevStep);
+                for (int i = 1; i < doe.Exprs.Length; i++)
+                {
+                    var thisStep = Gen();
+                    Compile(doe.Exprs[i], thisStep);
+                    var nextStep = i == doe.Exprs.Length - 1 ? res : Gen();
+                    _instructions.Add(new BinaryInst(PortKind.ExtFn, Builtins.SeqLabel, prevStep, thisStep, nextStep));
+                    prevStep = nextStep;
+                }
             }
+            return;
+        }
 
+        if (e is PrintExpr print)
+        {
+            var io = Gen();
+            var val = Gen();
+            Compile(print.Io, io);
+            Compile(print.Val, val);
+            _instructions.Add(new BinaryInst(PortKind.ExtFn, TEMP_PRINT, io, val, res));
             return;
         }
 

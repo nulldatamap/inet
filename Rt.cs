@@ -6,13 +6,21 @@ namespace  inet;
 public static class Builtins
 {
     public const ushort AddLabel = 0;
+    public const ushort SeqLabel = 1;
 
     public static void RegisterBuiltins(ref Rt rt)
     {
         rt.ExtFns.Add(Add);
+        rt.ExtFns.Add(Seq);
     }
 
     static ExtVal Add(ExtVal a, ExtVal b) => ExtVal.FromImm(a.Imm + b.Imm);
+
+    static ExtVal Seq(ExtVal a, ExtVal b)
+    {
+        b.Drop();
+        return a;
+    }
 }
 
 public ref struct Rt

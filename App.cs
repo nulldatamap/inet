@@ -158,9 +158,13 @@ class Application
         //     bin(PortKind.ExtFn,           0, 1, 3, 2);
         //     nil(Port.FromExtVal(99), 3);
         // });
+
         var prog = Compiler.CompileExpr(
-            Expr.Let("x", Expr.I32(3),
-                Expr.Add(Expr.Var("x"), Expr.Add(Expr.Var("x"), Expr.Var("x")))));
+            Expr.Do(
+                Expr.Print(Expr.Var("io"), Expr.I32(1)),
+                Expr.Print(Expr.Var("io"), Expr.I32(2)),
+                Expr.Print(Expr.Var("io"), Expr.I32(3))
+            ));
 
         Console.WriteLine(prog);
 
