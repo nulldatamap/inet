@@ -1,4 +1,5 @@
-﻿using Spectre.Console;
+﻿using System.Diagnostics;
+using Spectre.Console;
 
 namespace inet;
 
@@ -20,7 +21,6 @@ class Visualizer
         AnsiConsole.WriteLine();
         AnsiConsole.ResetColors();
         AnsiConsole.Write(new Rule());
-        AnsiConsole.WriteLine();
         VisualizeActivations(rt.ActiveFast);
         AnsiConsole.WriteLine();
         VisualizeActivations(rt.ActiveSlow);
@@ -89,9 +89,9 @@ class Visualizer
             var text = port.Kind switch
             {
                 PortKind.Wire => $"{(((ulong)port.Wire.Raw) >> 3)&0xFF:X02}",
-                PortKind.ExtVal => $"{port.ExtVal&0xFF:X02}",
+                PortKind.ExtVal => $"{(port.ExtVal.Raw >> 4)&0xFF:X02}",
                 PortKind.ExtFn => $"{port.Label&0xFF:X02}",
-                PortKind.Global => $"{port.ExtVal&0xFF:X02}",
+                PortKind.Global => $"{port.Addr&0xFF:X02}",
                 PortKind.Comb => $"{port.Label:X02}" ,
                 PortKind.Branch => $"??",
                 PortKind.Eraser => "!!",
@@ -136,6 +136,7 @@ class Application
         var heap = new Heap(baseHeap);
         var rt = new Rt(heap);
         var log = new List<string>();
+        Cell<ulong> ioCell = new(0);
 
         // var prog = Program.Build((bin, nil) =>
         // {
@@ -160,8 +161,8 @@ class Application
         // });
         var prog = Compiler.CompileExpr(
             Expr.Add(
-                Expr.If(Expr.I32(0), Expr.I32(0x77), Expr.I32(0x88)),
-                Expr.If(Expr.I32(1), Expr.I32(0x11), Expr.I32(0x22))
+                Expr.If(Expr.I32(0), Expr.I32(0), Expr.I32(1)),
+                Expr.If(Expr.I32(1), Expr.I32(1), Expr.I32(0))
                 ));
 
         Console.WriteLine(prog);
@@ -169,12 +170,15 @@ class Application
         rt.Globals.Add(prog);
         rt.ExtFns.Add((io, val) =>
         {
+            ref var ioVal = ref io.Ref<ulong>();
+            ioVal.Value++;
             log.Add($"PRINT[{io}]: {val}");
-            return io + 1;
+            val.Drop();
+            return io;
         });
 
 
-        rt.Interact(Port.Global(0), Port.FromExtVal(0));
+        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell)));
         Console.WriteLine(rt.ToString());
 
         /*
@@ -213,7 +217,9 @@ class Application
         //
         // Console.WriteLine($"-------------------");
         //
-        while (true) {
+        while (true)
+        {
+            rt.InFastPhase = true;
             while (rt.ActiveFast.Count > 0)
             {
                 var (a, b) = rt.ActiveFast.Pop();
@@ -224,6 +230,7 @@ class Application
 
             if (rt.ActiveSlow.Count > 0)
             {
+                rt.InFastPhase = false;
                 var (a, b) = rt.ActiveSlow.Pop();
                 rt.Interact(a, b);
                 v.Visualize(rt, log);
@@ -234,5 +241,6 @@ class Application
                 break;
             }
         }
+        Debug.Assert(ioCell.RefCount == 0);
     }
 }

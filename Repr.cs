@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace inet;
 
@@ -65,6 +66,127 @@ public enum PortKind
     Eraser,
 }
 
+public struct Cell<T> where T : unmanaged
+{
+    private long _count;
+    private T _value;
+
+    public Cell(T v)
+    {
+        _value = v;
+        _count = 1;
+    }
+
+    public unsafe T* AsPointer() => (T*)Unsafe.AsPointer(ref _value);
+
+    public T Value
+    {
+        get
+        {
+            Debug.Assert(_count > 0);
+            return _value;
+        }
+        set
+        {
+            Debug.Assert(_count > 0);
+            _value = value;
+        }
+    }
+
+    public long RefCount => _count;
+
+    public void Increment()
+    {
+        var v = Interlocked.Increment(ref _count);
+        Debug.Assert(v >= 1);
+    }
+
+    public void Decrement()
+    {
+        var v = Interlocked.Decrement(ref _count);
+        Debug.Assert(v >= 0);
+    }
+}
+
+public readonly struct ExtVal
+{
+    private const ulong CELL_BIT = 0b1000;
+    private const int IMM_SHIFT = 4;
+
+    private readonly ulong _value;
+
+    ExtVal(ulong v)
+    {
+        Debug.Assert((v & 0b111) == 0);
+        _value = v;
+    }
+
+    public static ExtVal FromImm(ulong x)
+    {
+        var imm = x << IMM_SHIFT;
+        Debug.Assert((imm >> IMM_SHIFT) == x);
+        return new ExtVal(imm);
+    }
+
+    public static unsafe ExtVal FromRef<T>(ref Cell<T> c) where T: unmanaged
+    {
+        var addr = (ulong)c.AsPointer();
+        Debug.Assert((addr & CELL_BIT) != 0);
+        return new ExtVal(addr);
+    }
+
+    public static ExtVal FromRaw(ulong x)
+    {
+        return new ExtVal(x);
+    }
+
+    public ulong Raw => _value;
+
+    public bool IsImm => (_value & CELL_BIT) == 0;
+    public bool IsRef => !IsImm;
+
+    public bool IsTruthy => _value != 0;
+
+    public ulong Imm
+    {
+        get
+        {
+            Debug.Assert((_value & CELL_BIT) == 0);
+            return _value >> IMM_SHIFT;
+        }
+    }
+
+    public unsafe ref Cell<T> Ref<T>() where T: unmanaged
+    {
+        Debug.Assert((_value & CELL_BIT) != 0);
+        return ref Unsafe.AsRef<Cell<T>>(&((ulong*)_value)[-1]);
+    }
+
+    public ExtVal Dup()
+    {
+        if (IsRef)
+            Ref<ulong>().Increment();
+        return this;
+    }
+
+    public void Drop()
+    {
+        if (IsRef)
+            Ref<ulong>().Decrement();
+    }
+
+    public override string ToString()
+    {
+        if (IsImm)
+        {
+            return $"{Imm}";
+        }
+
+        var c = Ref<ulong>();
+        return $"@[{c.RefCount}]{_value:X08}";
+    }
+}
+
 public record struct Port
 {
     private const ulong KIND_MASK = 0b111;
@@ -82,10 +204,10 @@ public record struct Port
     public ushort Label => (ushort)(_value >> INDEX_SHIFT);
     public ushort SwappedLabel => (ushort)(Label ^ SWAP_BIT);
     public ulong Addr => _value & ADDR_MASK;
-    public ulong ExtVal => (_value & ~KIND_MASK) >> KIND_SHIFT;
+    public ExtVal ExtVal => ExtVal.FromRaw(_value & ~KIND_MASK);
 
     public static Port Eraser() => new Port(PortKind.Eraser, 0, 0);
-    public static Port FromExtVal(ulong val) => new Port((val << KIND_SHIFT) | (ulong)PortKind.ExtVal);
+    public static Port FromExtVal(ExtVal val) => new Port(val.Raw | (ulong)PortKind.ExtVal);
     public static Port Global(ulong globalId) => new Port(PortKind.Global, 0, globalId);
 
     public bool IsAssigned
@@ -106,6 +228,18 @@ public record struct Port
     public bool IsBinary => IsBinaryKind(Kind);
     public bool IsNilary => IsNilaryKind(Kind);
 
+    public Port Dup()
+    {
+        if (Kind == PortKind.ExtVal)
+            return FromExtVal(ExtVal.Dup());
+        return this;
+    }
+
+    public void Drop()
+    {
+        if (Kind == PortKind.ExtVal)
+            ExtVal.Drop();
+    }
 
     public (Wire Left, Wire Right) Aux
     {
