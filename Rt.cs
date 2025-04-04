@@ -11,7 +11,7 @@ public static class Builtins
     {
         rt.ExtFns.Add(Add);
     }
-    
+
     static ulong Add(ulong a, ulong b) => a + b;
 }
 
@@ -78,10 +78,10 @@ public ref struct Rt
         else
         {
             // Annihilate
-            if ((a.Kind == b.Kind && a.Kind is PortKind.Comb or PortKind.ExtFn && a.Label == b.Label) 
-                // Copy 
-                || (a.Kind is PortKind.Eraser or PortKind.ExtVal)
-                || (b.Kind is PortKind.Eraser or PortKind.ExtVal)) 
+            if ((a.Kind == b.Kind && a.IsBinary && a.Label == b.Label)
+                // Copy
+                || (a.IsNilary && b.Kind != PortKind.Branch)
+                || (b.IsNilary && a.Kind != PortKind.Branch))
                 ActiveFast.Push((a, b));
             else
                 ActiveSlow.Push((a, b));
@@ -103,14 +103,13 @@ public ref struct Rt
             Debug.Assert(a.ExtVal < (ulong)Globals.Count);
             Execute(Globals[(int)a.ExtVal], b);
         } else if (a.Kind == b.Kind
-                   && a.Kind is PortKind.Comb or PortKind.ExtFn
+                   && a.IsBinary
                    && a.Label == b.Label)
         {
             // Annihilate
             LinkWire(a.Aux.Left, b.Aux.Left.ToPort());
             LinkWire(a.Aux.Right, b.Aux.Right.ToPort());
-        } else if (a.Kind is PortKind.Comb or PortKind.ExtFn
-                   && b.Kind is PortKind.Comb or PortKind.ExtFn)
+        } else if (a.IsBinary && b.IsBinary)
         {
             // Commute
             var al = Heap.AllocNode(PortKind.Comb, a.Label);
@@ -141,11 +140,23 @@ public ref struct Rt
                     return;
                 }
             }
-            
+
             var newFn = Heap.AllocNode(PortKind.ExtFn, a.SwappedLabel);
             LinkWire(a.Aux.Left, newFn);
             LinkWire(newFn.Aux.Left, b);
             LinkWire(newFn.Aux.Right, a.Aux.Right.ToPort());
+        }
+        else if (a.Kind == PortKind.Branch && b.Kind == PortKind.ExtVal)
+        {
+            // Branch
+            var newBr = Heap.AllocNode(PortKind.Branch, 0);
+            LinkWire(a.Aux.Left, newBr);
+            var (thenW, elseW) =
+                b.ExtVal != 0 ?
+                    (newBr.Aux.Left, newBr.Aux.Right) :
+                    (newBr.Aux.Right, newBr.Aux.Left);
+            LinkWire(elseW, Port.Eraser());
+            LinkWire(thenW, a.Aux.Right.ToPort());
         }
         else if (sym)
         {
@@ -161,10 +172,10 @@ public ref struct Rt
     {
         var (id, swp) = fn.GetExtFn();
         Debug.Assert(id < ExtFns.Count);
-        
+
         if (swp)
             return ExtFns[id](b, a);
-        
+
         return ExtFns[id](a, b);
     }
 
@@ -203,14 +214,14 @@ public ref struct Rt
                     Regs: (var a, var l, var r)
                 })
             {
-                Debug.Assert(k is PortKind.Comb or PortKind.ExtFn);
+                Debug.Assert(Port.IsBinaryKind(k));
                 var node = Heap.AllocNode(k, lbl);
                 LinkRegister(a.Index, node);
                 LinkRegister(l.Index, node.Aux.Left.ToPort());
                 LinkRegister(r.Index, node.Aux.Right.ToPort());
             } else if (inst is NilaryInst { Value: var x, Reg: var q })
             {
-                Debug.Assert(x.Kind is PortKind.Eraser or PortKind.Global or PortKind.ExtVal);
+                Debug.Assert(x.IsNilary);
                 LinkRegister(q.Index, x);
             }
         }

@@ -6,6 +6,8 @@ namespace inet;
 
 public ref struct Heap
 {
+    const ulong FREE = ulong.MaxValue & ~0b111UL;
+
     public Span<ulong> Cells;
     public unsafe ulong* LastFree;
     public int Head;
@@ -33,7 +35,9 @@ public ref struct Heap
         if (LastFree != null)
         {
             pair = new Span<ulong>(LastFree, 2);
-            LastFree = (ulong*)new Port(*LastFree).Addr;
+            var freeNode = pair[0];
+            LastFree =
+                freeNode == FREE ? null : (ulong*)freeNode;
         }
         else
         {
@@ -41,9 +45,9 @@ public ref struct Heap
                 throw new OutOfMemoryException("Ran out of heap space");
 
             pair = Cells.Slice(Head, 2);
+            Head += 2;
         }
 
-        Head += 2;
         return pair;
     }
 
@@ -72,7 +76,7 @@ public ref struct Heap
                 var p = new Port(Cells[i]);
                 sb.Append($"{(ulong)&baseAddr[i]:X08}:  {p, 16}");
 
-                if (p.Kind != PortKind.Free)
+                if (!p.IsFreeNode)
                 {
                     sb.Append($"   x{GetIndex(&baseAddr[i])}");
                     if (p.Kind is PortKind.Comb or PortKind.Wire)
@@ -125,7 +129,6 @@ public ref struct Heap
             case PortKind.ExtFn:
             case PortKind.Global:
             case PortKind.Eraser:
-            case PortKind.Free:
             default:
                 return p.ToString();
         }
@@ -135,22 +138,17 @@ public ref struct Heap
     {
         Debug.Assert(addr >= Unsafe.AsPointer(ref Cells[0]));
         Debug.Assert(addr < Unsafe.AsPointer(ref Cells[Head]));
-        bool isEvenAddress = ((ulong)addr) % 16 == 0;
-        if (&addr[1] < Unsafe.AsPointer(ref Cells[Head])
-            && isEvenAddress
-            && new Port(addr[1]).Kind == PortKind.Free)
-        {
-            LastFree = addr;
-            *addr = Port.Free(LastFree).RawValue;
-            return;
-        }
 
-        *addr = Port.Free(null).RawValue;
+        *addr = FREE;
 
-        if (!isEvenAddress && new Port(addr[-1]).Kind == PortKind.Free)
+        var freeHead = (ulong*)(((ulong)addr) & ~0b1111UL);
+        if (new Port(*freeHead).IsFreeNode
+            && freeHead[0] == FREE
+            && freeHead[1] == FREE)
         {
-            LastFree = addr;
-            addr[-1] = Port.Free(LastFree).RawValue;
+            if (LastFree != null)
+                *freeHead = (ulong)LastFree;
+            LastFree = freeHead;
         }
     }
 }

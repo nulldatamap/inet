@@ -60,9 +60,9 @@ public enum PortKind
     ExtFn,
     Global,
     Comb,
+    Branch,
     Wire,
     Eraser,
-    Free,
 }
 
 public record struct Port
@@ -85,18 +85,33 @@ public record struct Port
     public ulong ExtVal => (_value & ~KIND_MASK) >> KIND_SHIFT;
 
     public static Port Eraser() => new Port(PortKind.Eraser, 0, 0);
-    public static unsafe Port Free(ulong* next) => new Port(PortKind.Free, 0, (ulong)next);
     public static Port FromExtVal(ulong val) => new Port((val << KIND_SHIFT) | (ulong)PortKind.ExtVal);
     public static Port Global(ulong globalId) => new Port(PortKind.Global, 0, globalId);
 
-    public bool IsAssigned => Kind is not (PortKind.Unassigned or PortKind.Free);
+    public bool IsAssigned
+    {
+        get
+        {
+            if (Kind == PortKind.Unassigned)
+                Debug.Assert(_value == 0);
+            return Kind != PortKind.Unassigned;
+        }
+    }
+
+    public bool IsFreeNode => Kind == PortKind.Unassigned && _value != 0;
+
+    public static bool IsBinaryKind(PortKind k) => k is PortKind.Branch or PortKind.Comb or PortKind.ExtFn;
+    public static bool IsNilaryKind(PortKind k) => k is PortKind.Eraser or PortKind.Global or PortKind.ExtVal;
+
+    public bool IsBinary => IsBinaryKind(Kind);
+    public bool IsNilary => IsNilaryKind(Kind);
 
 
     public (Wire Left, Wire Right) Aux
     {
         get
         {
-            Debug.Assert(Kind is PortKind.Comb or PortKind.ExtFn);
+            Debug.Assert(IsBinary);
             var addr = _value & ADDR_MASK;
             return (new Wire(addr), new Wire(addr + sizeof(ulong)));
         }
@@ -116,7 +131,7 @@ public record struct Port
         Debug.Assert(Kind == PortKind.ExtFn);
         return (Label & ~SWAP_BIT, (Label & SWAP_BIT) != 0);
     }
-    
+
 
     public Port(PortKind kind, ushort index, ulong value)
     {
@@ -137,9 +152,11 @@ public record struct Port
         switch (Kind)
         {
             case PortKind.Unassigned:
-                return "-";
+                return _value != 0 ? "<FREE>" : "-";
             case PortKind.Comb:
                 return $"C:{Label:X02}:{_value&ADDR_MASK:X08}";
+            case PortKind.Branch:
+                return $"B:{_value&ADDR_MASK:X08}";
             case PortKind.ExtVal:
                 return $"EXT:{ExtVal:X02}";
             case PortKind.ExtFn:
@@ -148,8 +165,6 @@ public record struct Port
                 return $"G:{ExtVal:X02}";
             case PortKind.Eraser:
                 return "_";
-            case PortKind.Free:
-                return "<FREE>";
             case PortKind.Wire:
                 return Wire.ToString();
             default:

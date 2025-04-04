@@ -80,9 +80,10 @@ class Visualizer
                 PortKind.ExtFn => Color.BlueViolet,
                 PortKind.Global => Color.Cyan3,
                 PortKind.Comb => Color.Green,
+                PortKind.Branch => Color.Pink3,
                 PortKind.Eraser => Color.Red,
+                PortKind.Unassigned when port.IsFreeNode => Color.Grey11,
                 PortKind.Unassigned => Color.Grey23,
-                PortKind.Free => Color.Grey11,
             };
 
             var text = port.Kind switch
@@ -92,9 +93,12 @@ class Visualizer
                 PortKind.ExtFn => $"{port.Label&0xFF:X02}",
                 PortKind.Global => $"{port.ExtVal&0xFF:X02}",
                 PortKind.Comb => $"{port.Label:X02}" ,
+                PortKind.Branch => $"??",
                 PortKind.Eraser => "!!",
+                PortKind.Unassigned when port.IsFreeNode =>
+                    port.RawValue != (ulong.MaxValue & ~0b111UL) ? "!." : "..",
                 PortKind.Unassigned => "--",
-                PortKind.Free => port.Addr != 0 ? "!." : "..",
+                _ => "%%",
             };
 
             AnsiConsole.Background = background;
@@ -154,8 +158,12 @@ class Application
         //     bin(PortKind.ExtFn,           0, 1, 3, 2);
         //     nil(Port.FromExtVal(99), 3);
         // });
-        var prog = Compiler.CompileExpr(Expr.Add(Expr.I32(3), Expr.I32(9)));
-        
+        var prog = Compiler.CompileExpr(
+            Expr.Add(
+                Expr.If(Expr.I32(0), Expr.I32(0x77), Expr.I32(0x88)),
+                Expr.If(Expr.I32(1), Expr.I32(0x11), Expr.I32(0x22))
+                ));
+
         Console.WriteLine(prog);
 
         rt.Globals.Add(prog);
