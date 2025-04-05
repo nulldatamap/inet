@@ -10,6 +10,8 @@ public abstract class Expr
     public static IfExpr If(Expr c, Expr t, Expr e) => new (c, t, e);
     public static LetExpr Let(string n, Expr x, Expr body) => new (n, x, body);
     public static DoExpr Do(params Expr[] es) => new (es);
+    public static CallExpr Call(Expr fn, params Expr[] es) => new (fn, es);
+    public static LamExpr Lam(string[] prms, Expr b) => new (prms, b);
 
     public static PrintExpr Print(Expr io, Expr val) => new(io, val);
     // public static InlineExpr Inline(Func<Reg[], Inst[]> insts, params Expr[] es) => new bool(insts, es);
@@ -59,6 +61,18 @@ public sealed class PrintExpr(Expr io, Expr val) : Expr
     public readonly Expr Val = val;
 }
 
+public sealed class CallExpr(Expr fn, Expr[] args) : Expr
+{
+    public readonly Expr Fn = fn;
+    public readonly Expr[] Args = args;
+}
+
+public sealed class LamExpr(string[] prms, Expr b) : Expr
+{
+    public readonly string[] Params = prms;
+    public readonly Expr Body = b;
+}
+
 class Slot
 {
     public Slot? Prev;
@@ -72,9 +86,9 @@ class Slot
     }
 }
 
-class Scope
+class Scope(Scope? p = null)
 {
-    public Scope? Parent;
+    public Scope? Parent = p;
     public Dictionary<string, Slot> Slots = new Dictionary<string, Slot>();
 
     public bool TryLookup(string name, out Slot slot)
@@ -108,10 +122,10 @@ class Scope
 
 public class Compiler
 {
-    static Reg _root = new Reg(0);
-    int _nextReg = 1;
+    private static Reg _root = new Reg(0);
+    private int _nextReg = 1;
     private int _dupCount = 0;
-    List<Inst> _instructions = new List<Inst>();
+    private List<Inst> _instructions = new List<Inst>();
 
     Scope _scope = new Scope();
 
@@ -149,6 +163,39 @@ public class Compiler
         _instructions.Add(new BinaryInst(PortKind.Comb, (ushort)(Dup0 + _dupCount++), x, x0, x1));
     }
 
+    void Erase(Reg x)
+    {
+        _instructions.Add(new NilaryInst(x, Port.Eraser()));
+    }
+    
+    void Val(Reg x, ExtVal v)
+    {
+        _instructions.Add(new NilaryInst(x, Port.FromExtVal(v)));
+    }
+
+    void ExtFn(ushort label, Reg l, Reg r, Reg res)
+    {
+        _instructions.Add(new BinaryInst(PortKind.ExtFn, label, l, r, res));
+    }
+
+    void Branch(Reg c, Reg t, Reg f, Reg res)
+    {
+        // c = (? (? t f) res)
+        var q = Gen();
+        _instructions.Add(new BinaryInst(PortKind.Branch, 0, c, q, res));
+        _instructions.Add(new BinaryInst(PortKind.Branch, 0, q, t, f));
+    }
+
+    void App(Reg fn, Reg arg, Reg res)
+    {
+        _instructions.Add(new BinaryInst(PortKind.Comb, Fn, fn, arg, res));
+    }
+    
+    void Lam(Reg prm, Reg body, Reg fn)
+    {
+        _instructions.Add(new BinaryInst(PortKind.Comb, Fn, fn, prm, body));
+    }
+
     Reg MaterializeUsers(Slot slot)
     {
         // Exactly one user, so just link directly
@@ -158,8 +205,9 @@ public class Compiler
         var src = Gen();
         if (slot.Users.Count > 1)
         {
-            var from = src;
             // More than one user, so we need to duplicate the value
+            var from = src;
+            // src = dup(u0 dup(u1 dup(u2 u3)))
             while (slot.Users.Count > 0)
             {
                 var user = slot.Users.Pop();
@@ -172,42 +220,44 @@ public class Compiler
         }
 
         // Variable is not used, so erase it
-        _instructions.Add(new NilaryInst(src, Port.Eraser()));
+        Erase(src);
         return src;
     }
 
+    Reg Compile(Expr e)
+    {
+        var res = Gen();
+        Compile(e, res);
+        return res;
+    }
+    
     void Compile(Expr e, Reg res)
     {
         if (e is Lit lit)
         {
             // res = <lit>
-            _instructions.Add(new NilaryInst(res, Port.FromExtVal(lit.Repr)));
+            Val(res, lit.Repr);
             return;
         }
 
         if (e is BinExpr bine)
         {
             // l = <BINOP>(r res)
-            var l = Gen();
-            var r = Gen();
-            _instructions.Add(new BinaryInst(PortKind.ExtFn, Builtins.AddLabel, l, r, res));
-            Compile(bine.Left, l);
-            Compile(bine.Right, r);
+            ExtFn(Builtins.AddLabel,
+                Compile(bine.Left),
+                Compile(bine.Right),
+                res);
             return;
         }
 
         if (e is IfExpr ife)
         {
             // c = ?(?(t f) res)
-            var c = Gen();
-            var t = Gen();
-            var f = Gen();
-            var q = Gen();
-            _instructions.Add(new BinaryInst(PortKind.Branch, 0, c, q, res));
-            _instructions.Add(new BinaryInst(PortKind.Branch, 0, q, t, f));
-            Compile(ife.Cond, c);
-            Compile(ife.Then, t);
-            Compile(ife.Else, f);
+            Branch(
+                Compile(ife.Cond),
+                Compile(ife.Then),
+                Compile(ife.Else),
+                res);
             return;
         }
 
@@ -229,6 +279,7 @@ public class Compiler
         {
             var varSlot = _scope.Define(let.Var);
             Compile(let.Body, res);
+            _scope.Undefine(let.Var);
             Compile(let.Val, MaterializeUsers(varSlot));
             return;
         }
@@ -237,34 +288,90 @@ public class Compiler
         {
             if (doe.Exprs.Length == 0)
             {
-                _instructions.Add(new NilaryInst(res, Port.FromExtVal(ExtVal.FromImm(0))));
+                Val(res, ExtVal.Nil);
             } else if (doe.Exprs.Length == 1)
             {
                 Compile(doe.Exprs[0], res);
             }
             else
             {
+                // SEQ(SEQ(SEQ(e3 e2) e1) e0)
                 var prevStep = Gen();
                 Compile(doe.Exprs[0], prevStep);
                 for (int i = 1; i < doe.Exprs.Length; i++)
                 {
-                    var thisStep = Gen();
-                    Compile(doe.Exprs[i], thisStep);
                     var nextStep = i == doe.Exprs.Length - 1 ? res : Gen();
-                    _instructions.Add(new BinaryInst(PortKind.ExtFn, Builtins.SeqLabel, prevStep, thisStep, nextStep));
+                    ExtFn(Builtins.SeqLabel,
+                        prevStep,
+                        Compile(doe.Exprs[i]),
+                        nextStep);
                     prevStep = nextStep;
                 }
             }
             return;
         }
 
+        if (e is CallExpr call)
+        {
+            var fnVal = Gen();
+            Compile(call.Fn, fnVal);
+
+            // If we're calling a function that doesn't have any parameters, we pass in a dummy argument
+            if (call.Args.Length == 0)
+            {
+                var nil = Gen();
+                Val(nil, ExtVal.Nil);
+                App(fnVal, nil, res);
+                return;
+            }
+
+            var callee = fnVal;
+            // <fn> = fn(x0 fn(x1 fn(x2 res)))
+            for(int i = 0; i < call.Args.Length; i++)
+            {
+                var ret = i == call.Args.Length - 1 ? res : Gen();
+                App(callee, Compile(call.Args[i]), ret);
+                callee = ret;
+            }
+            
+            return;
+        }
+
+        if (e is LamExpr lam)
+        {
+            _scope = new Scope(_scope);
+            var slots = lam.Params.Select(prm => _scope.Define(prm)).ToArray();
+            var body = Compile(lam.Body);
+            _scope = _scope.Parent;
+
+            // If the lambda takes no arguments, put in a dummy one
+            if (slots.Length == 0)
+            {
+                var nil = Gen();
+                Val(nil, ExtVal.Nil);
+                Lam(nil, body, res);
+                return;
+            }
+
+            var head = res;
+            // res = fn(x0 fn(x1 (fn x2 body)))
+            for(int i = 0; i < slots.Length; i++)
+            {
+                var isLast = i == slots.Length - 1;
+                var inner = isLast ? body : Gen();
+                Lam(MaterializeUsers(slots[i]), inner, head);
+                head = inner;
+            }
+            
+            return;
+        }
+
         if (e is PrintExpr print)
         {
-            var io = Gen();
-            var val = Gen();
-            Compile(print.Io, io);
-            Compile(print.Val, val);
-            _instructions.Add(new BinaryInst(PortKind.ExtFn, TEMP_PRINT, io, val, res));
+            ExtFn(TEMP_PRINT,
+                Compile(print.Io),
+                Compile(print.Val),
+                res);
             return;
         }
 

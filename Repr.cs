@@ -115,6 +115,8 @@ public readonly struct ExtVal
 
     private readonly ulong _value;
 
+    public static readonly ExtVal Nil = default;
+
     ExtVal(ulong v)
     {
         Debug.Assert((v & 0b111) == 0);

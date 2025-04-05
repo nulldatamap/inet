@@ -161,9 +161,9 @@ class Application
 
         var prog = Compiler.CompileExpr(
             Expr.Do(
-                Expr.Print(Expr.Var("io"), Expr.I32(1)),
-                Expr.Print(Expr.Var("io"), Expr.I32(2)),
-                Expr.Print(Expr.Var("io"), Expr.I32(3))
+                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam(["x"], Expr.Var("x")), Expr.I32(1))),
+                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam(["x", "y"], Expr.Add(Expr.Var("x"), Expr.Var("x"))), Expr.I32(9), Expr.I32(2))),
+                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam([], Expr.I32(3))))
             ));
 
         Console.WriteLine(prog);
