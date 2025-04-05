@@ -1,4 +1,6 @@
-﻿namespace inet;
+﻿using System.Diagnostics;
+
+namespace inet;
 
 using Reg = Register;
 
@@ -12,7 +14,8 @@ public abstract class Expr
     public static DoExpr Do(params Expr[] es) => new (es);
     public static CallExpr Call(Expr fn, params Expr[] es) => new (fn, es);
     public static LamExpr Lam(string[] prms, Expr b) => new (prms, b);
-
+    public static TupExpr Tup(params Expr[] es) => new (es);
+    public static UntupExpr Untup(string[] xs, Expr t, Expr b) => new (xs, t, b);
     public static PrintExpr Print(Expr io, Expr val) => new(io, val);
     // public static InlineExpr Inline(Func<Reg[], Inst[]> insts, params Expr[] es) => new bool(insts, es);
 }
@@ -73,16 +76,28 @@ public sealed class LamExpr(string[] prms, Expr b) : Expr
     public readonly Expr Body = b;
 }
 
+public sealed class TupExpr(params Expr[] es) : Expr
+{
+    public readonly Expr[] Items = es;
+}
+
+public sealed class UntupExpr(string[] xs, Expr tup, Expr body) : Expr
+{
+    public readonly string[] Vars = xs;
+    public readonly Expr Tup = tup;
+    public readonly Expr Body = body;
+}
+
 class Slot
 {
     public Slot? Prev;
     public string Name;
-    public Stack<Reg> Users;
+    public List<Reg> Users;
 
     public Slot(string name)
     {
         Name = name;
-        Users = new Stack<Reg>();
+        Users = new List<Reg>();
     }
 }
 
@@ -130,7 +145,8 @@ public class Compiler
     Scope _scope = new Scope();
 
     private const ushort Fn = 0;
-    private const ushort Dup0 = 0x10;
+    private const ushort Constr = 1;
+    private const ushort Dup0 = 2;
 
     private const ushort TEMP_PRINT = 2;
 
@@ -196,26 +212,50 @@ public class Compiler
         _instructions.Add(new BinaryInst(PortKind.Comb, Fn, fn, prm, body));
     }
 
+    void Tup(Reg l, Reg r, Reg res)
+    {
+        _instructions.Add(new BinaryInst(PortKind.Comb, Constr, l, r, res));
+    }
+    
+    void RightChain<L, T>(Reg head, L xs, Func<T, Reg> f, Action<Reg, Reg, Reg> g, Func<Reg>? final = null) where L: IList<T>
+    {
+        // x0..x3 = map f xs
+        if (final == null)
+        {
+            // head = <g>(x0 <g>(x1 <g>(x2 x3)))
+            for(int i = 0; i < xs.Count - 1; i++)
+            {
+                var right = i == xs.Count - 2 ? f(xs[^1]) : Gen();
+                g(head, f(xs[i]), right);
+                head = right;
+            }
+        }
+        else
+        {
+            // head = <g>(x0 <g>(x1 <g>(x2 final)))
+            for (int i = 0; i < xs.Count; i++)
+            {
+                var right = i == xs.Count - 1 ? final() : Gen();
+                g(f(xs[i]), right, head);
+                head = right;
+            }
+        }
+    }
+
     Reg MaterializeUsers(Slot slot)
     {
         // Exactly one user, so just link directly
         if(slot.Users.Count == 1)
-            return slot.Users.Pop();
+            return slot.Users[0];
 
         var src = Gen();
         if (slot.Users.Count > 1)
         {
+            // Respect the side effect order
+            slot.Users.Reverse();
             // More than one user, so we need to duplicate the value
-            var from = src;
             // src = dup(u0 dup(u1 dup(u2 u3)))
-            while (slot.Users.Count > 0)
-            {
-                var user = slot.Users.Pop();
-                var newFrom = slot.Users.Count == 1 ? slot.Users.Pop() : Gen();
-                Dup(from, user, newFrom);
-                from = newFrom;
-            }
-
+            RightChain<List<Reg>, Reg>(src, slot.Users, x => x, Dup);
             return src;
         }
 
@@ -265,7 +305,7 @@ public class Compiler
         {
             if (_scope.TryLookup(var.Name, out var slot))
             {
-                slot.Users.Push(res);
+                slot.Users.Add(res);
             }
             else
             {
@@ -325,15 +365,11 @@ public class Compiler
                 return;
             }
 
-            var callee = fnVal;
             // <fn> = fn(x0 fn(x1 fn(x2 res)))
-            for(int i = 0; i < call.Args.Length; i++)
+            RightChain<Expr[], Expr>(fnVal, call.Args, Compile, (arg, ret, callee) =>
             {
-                var ret = i == call.Args.Length - 1 ? res : Gen();
-                App(callee, Compile(call.Args[i]), ret);
-                callee = ret;
-            }
-            
+                App(callee, arg, ret);
+            }, () => res);
             return;
         }
 
@@ -353,16 +389,29 @@ public class Compiler
                 return;
             }
 
-            var head = res;
             // res = fn(x0 fn(x1 (fn x2 body)))
-            for(int i = 0; i < slots.Length; i++)
-            {
-                var isLast = i == slots.Length - 1;
-                var inner = isLast ? body : Gen();
-                Lam(MaterializeUsers(slots[i]), inner, head);
-                head = inner;
-            }
+            RightChain<Slot[], Slot>(res, slots, MaterializeUsers, Lam, () => body);
+            return;
+        }
+
+        if (e is TupExpr tupe)
+        {
+            Debug.Assert(tupe.Items.Length >= 2);
+            // res = tup(e0 tup(e1 tup(e2 e3)))
+            RightChain<Expr[], Expr>(res, tupe.Items, Compile, Tup);
+            return;
+        }
+        
+        if (e is UntupExpr untupe)
+        {
+            Debug.Assert(untupe.Vars.Length >= 2);
+            _scope = new Scope(_scope);
+            var slots = untupe.Vars.Select(prm => _scope.Define(prm)).ToArray();
+            Compile(untupe.Body, res);
+            _scope = _scope.Parent;
             
+            // tup(e0 tup(e1 tup(e2 e3))) = t
+            RightChain<Slot[], Slot>(Compile(untupe.Tup), slots, MaterializeUsers, Tup);
             return;
         }
 

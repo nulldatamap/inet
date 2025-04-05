@@ -95,14 +95,20 @@ public ref struct Heap
     public string Pretty(Port p, HashSet<Wire>? seen = null)
     {
         seen ??= [];
-        string[] names = ["fn", "dup"];
+        string[] names = p.Kind == PortKind.Comb ? ["fn", "tup", "dup"] : ["add", "seq", "print"];
         switch (p.Kind)
         {
-            case PortKind.Comb:
-                var label = $"{p.Label:X02}";
+            case PortKind.ExtFn or PortKind.Branch or PortKind.Comb:
+                var s = p.Kind switch
+                {
+                    PortKind.Comb => "",
+                    PortKind.Branch => "?",
+                    _ => "EXT:"
+                };
+                var label = $"dup{p.Label-2}";
                 if (p.Label < names.Length)
                     label = names[p.Label];
-                return $"{label}({Pretty(p.Aux.Left.ToPort(), seen)} {Pretty(p.Aux.Right.ToPort(), seen)})";
+                return $"{s}{label}({Pretty(p.Aux.Left.ToPort(), seen)} {Pretty(p.Aux.Right.ToPort(), seen)})";
             case PortKind.Wire:
                 if (seen.Add(p.Wire))
                 {
@@ -126,7 +132,6 @@ public ref struct Heap
 
             case PortKind.Unassigned:
             case PortKind.ExtVal:
-            case PortKind.ExtFn:
             case PortKind.Global:
             case PortKind.Eraser:
             default:

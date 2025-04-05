@@ -160,11 +160,14 @@ class Application
         // });
 
         var prog = Compiler.CompileExpr(
+            Expr.Untup(["t0", "t1", "t2"], Expr.Call(Expr.Lam(["q"], Expr.Var("q")), Expr.Tup(Expr.I32(1), Expr.I32(2), Expr.I32(3))),
             Expr.Do(
                 Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam(["x"], Expr.Var("x")), Expr.I32(1))),
-                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam(["x", "y"], Expr.Add(Expr.Var("x"), Expr.Var("x"))), Expr.I32(9), Expr.I32(2))),
-                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam([], Expr.I32(3))))
-            ));
+                Expr.Print(Expr.Var("io"),
+                    Expr.Call(Expr.Lam(["x", "y"], Expr.Add(Expr.Var("x"), Expr.Var("x"))), Expr.I32(9), Expr.I32(2))),
+                Expr.Print(Expr.Var("io"),
+                    Expr.Call(Expr.Lam([], Expr.Add(Expr.Var("t0"), Expr.Add(Expr.Var("t1"), Expr.Var("t2"))))))
+            )));
 
         Console.WriteLine(prog);
 
