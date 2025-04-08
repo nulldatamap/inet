@@ -92,8 +92,8 @@ public ref struct Rt
             // Annihilate
             if ((a.Kind == b.Kind && a.IsBinary && a.Label == b.Label)
                 // Copy
-                || (a.IsNilary && b.Kind is not (PortKind.Branch or PortKind.ExtFn))
-                || (b.IsNilary && a.Kind is not (PortKind.Branch or PortKind.ExtFn)))
+                || (a.IsNilary && a.Kind != PortKind.Global && b.Kind is not (PortKind.Branch or PortKind.ExtFn))
+                || (b.IsNilary && b.Kind != PortKind.Global && a.Kind is not (PortKind.Branch or PortKind.ExtFn)))
                 ActiveFast.Push((a, b));
             else
                 ActiveSlow.Push((a, b));
@@ -102,20 +102,20 @@ public ref struct Rt
 
     public void Interact(Port a, Port b, bool sym = true)
     {
-        if ((a.Kind == PortKind.Global && b.Kind == PortKind.Comb)
+        if ((a.Kind == PortKind.Global && b.Kind == PortKind.Comb && false /* todo, do label optimization */)
             || (a.Kind == PortKind.Eraser)
             || (a.Kind == PortKind.ExtVal && b.Kind == PortKind.Comb))
         {
-            Debug.Assert(InFastPhase);
+            // Debug.Assert(InFastPhase);
             // Copy
             LinkWire(b.Aux.Left, a);
             LinkWire(b.Aux.Right, a.Dup());
         } else if (a.Kind == PortKind.Global)
         {
             // Expand
-            Debug.Assert(InFastPhase);
-            Debug.Assert(a.Addr < (ulong)Globals.Count);
-            Execute(Globals[(int)a.Addr], b);
+            // Debug.Assert(!InFastPhase);
+            Debug.Assert(a.GlobalIndex < (ulong)Globals.Count);
+            Execute(Globals[(int)a.GlobalIndex], b);
         } else if (a.Kind == b.Kind
                    && a.IsBinary
                    && a.Label == b.Label)
@@ -255,6 +255,10 @@ public ref struct Rt
         foreach (var (x,y) in ActiveFast)
         {
             sb.AppendLine($"- {Heap.Pretty(x)} <> {Heap.Pretty(y)}");
+        }
+        foreach (var (x,y) in ActiveSlow)
+        {
+            sb.AppendLine($"= {Heap.Pretty(x)} <> {Heap.Pretty(y)}");
         }
         return sb.ToString();
     }

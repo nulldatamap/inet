@@ -206,11 +206,12 @@ public record struct Port
     public ushort Label => (ushort)(_value >> INDEX_SHIFT);
     public ushort SwappedLabel => (ushort)(Label ^ SWAP_BIT);
     public ulong Addr => _value & ADDR_MASK;
+    public ulong GlobalIndex => _value >> KIND_SHIFT;
     public ExtVal ExtVal => ExtVal.FromRaw(_value & ~KIND_MASK);
 
     public static Port Eraser() => new Port(PortKind.Eraser, 0, 0);
     public static Port FromExtVal(ExtVal val) => new Port(val.Raw | (ulong)PortKind.ExtVal);
-    public static Port Global(ulong globalId) => new Port(PortKind.Global, 0, globalId);
+    public static Port Global(ulong globalId) => new Port(PortKind.Global, 0, globalId << KIND_SHIFT);
 
     public bool IsAssigned
     {
@@ -298,7 +299,7 @@ public record struct Port
             case PortKind.ExtFn:
                 return $"EFN:{Label:X02}:{Addr:X08}";
             case PortKind.Global:
-                return $"G:{ExtVal:X02}";
+                return $"G:{GlobalIndex:X02}";
             case PortKind.Eraser:
                 return "_";
             case PortKind.Wire:

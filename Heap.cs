@@ -99,16 +99,17 @@ public ref struct Heap
         switch (p.Kind)
         {
             case PortKind.ExtFn or PortKind.Branch or PortKind.Comb:
-                var s = p.Kind switch
+                var (s, ( lbl, f)) = p.Kind switch
                 {
-                    PortKind.Comb => "",
-                    PortKind.Branch => "?",
-                    _ => "EXT:"
+                    PortKind.Comb => ("", (p.Label, false)),
+                    PortKind.Branch => ("?", ( p.Label, false)),
+                    _ => ("EFN:", p.GetExtFn()),
                 };
-                var label = $"dup{p.Label-2}";
-                if (p.Label < names.Length)
-                    label = names[p.Label];
-                return $"{s}{label}({Pretty(p.Aux.Left.ToPort(), seen)} {Pretty(p.Aux.Right.ToPort(), seen)})";
+                var label = $"dup{lbl-2}";
+                var flip = f ? "^" : "";
+                if (lbl < names.Length)
+                    label = names[lbl];
+                return $"{s}{flip}{label}({Pretty(p.Aux.Left.ToPort(), seen)} {Pretty(p.Aux.Right.ToPort(), seen)})";
             case PortKind.Wire:
                 if (seen.Add(p.Wire))
                 {

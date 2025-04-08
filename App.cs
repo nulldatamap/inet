@@ -10,7 +10,7 @@ class Visualizer
 
     public Visualizer()
     {
-        HeapView = (32, 24);
+        HeapView = (16, 24);
         WriteTimes = new float[HeapView.Width * HeapView.Height];
     }
 
@@ -51,6 +51,7 @@ class Visualizer
 
                 DrawPortCell(new Port(h.Cells[idx]), WriteTimes[idx]);
             }
+            AnsiConsole.WriteLine();
         }
     }
 
@@ -159,19 +160,10 @@ class Application
         //     nil(Port.FromExtVal(99), 3);
         // });
 
-        var prog = Compiler.CompileExpr(
-            Expr.Untup(["t0", "t1", "t2"], Expr.Call(Expr.Lam(["q"], Expr.Var("q")), Expr.Tup(Expr.I32(1), Expr.I32(2), Expr.I32(3))),
-            Expr.Do(
-                Expr.Print(Expr.Var("io"), Expr.Call(Expr.Lam(["x"], Expr.Var("x")), Expr.I32(1))),
-                Expr.Print(Expr.Var("io"),
-                    Expr.Call(Expr.Lam(["x", "y"], Expr.Add(Expr.Var("x"), Expr.Var("x"))), Expr.I32(9), Expr.I32(2))),
-                Expr.Print(Expr.Var("io"),
-                    Expr.Call(Expr.Lam([], Expr.Add(Expr.Var("t0"), Expr.Add(Expr.Var("t1"), Expr.Var("t2"))))))
-            )));
-
-        Console.WriteLine(prog);
-
-        rt.Globals.Add(prog);
+        rt.Globals.AddRange(Compiler.Compile(new Module([
+            new Def("main", Expr.Lam(["io"], Expr.Print(Expr.Var("io"), Expr.Call(Expr.Var("id"), Expr.I32(9))))),
+            new Def("id", Expr.Lam(["x"], Expr.Var("x")))
+        ])));
         rt.ExtFns.Add((io, val) =>
         {
             ref var ioVal = ref io.Ref<ulong>();
@@ -180,8 +172,8 @@ class Application
             val.Drop();
             return io;
         });
-
-
+        
+        rt.InFastPhase = false;
         rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell)));
         Console.WriteLine(rt.ToString());
 

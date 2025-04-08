@@ -88,6 +88,17 @@ public sealed class UntupExpr(string[] xs, Expr tup, Expr body) : Expr
     public readonly Expr Body = body;
 }
 
+public class Def(string name, Expr body)
+{
+    public readonly string Name = name;
+    public readonly Expr Body = body;
+}
+
+public class Module(Def[] defs)
+{
+    public Def[] Defs = defs;
+}
+
 class Slot
 {
     public Slot? Prev;
@@ -135,12 +146,21 @@ class Scope(Scope? p = null)
     }
 }
 
+class Global(string name, ulong index, Expr body)
+{
+    public readonly ulong Index = index;
+    public readonly string Name = name;
+    public readonly Expr Body = body;
+}
+
 public class Compiler
 {
     private static Reg _root = new Reg(0);
     private int _nextReg = 1;
     private int _dupCount = 0;
     private List<Inst> _instructions = new List<Inst>();
+    
+    Dictionary<string, Global> _globals = new Dictionary<string, Global>();
 
     Scope _scope = new Scope();
 
@@ -158,15 +178,37 @@ public class Compiler
         return c.Finish(e);
     }
 
+    public static Program[] Compile(Module m)
+    {
+        var c = new Compiler();
+        return c.CompileModule(m);
+    }
+
+    void Reset()
+    {
+        _nextReg = 1;
+        _dupCount = 0;
+        _instructions.Clear();
+        _scope = new Scope();
+    }
+    
+    Program[] CompileModule(Module m)
+    {
+        foreach (var def in m.Defs)
+            _globals[def.Name] = new Global(def.Name, (ulong)_globals.Count, def.Body);
+
+        return _globals.Values.Select(global =>
+        {
+            Reset();
+            var prog = Finish(global.Body);
+            Console.WriteLine($"::{global.Name}\n{prog}");
+            return prog;
+        }).ToArray();
+    }
+
     Program Finish(Expr e)
     {
-        var ioArg = _scope.Define("io");
-        var retVal = Gen();
-        Compile(e, retVal);
-        // Wrap the expression in a lambda that calls print on the result:
-        var ioVal = MaterializeUsers(ioArg);
-        _instructions.Add(new BinaryInst(PortKind.Comb, Fn, _root, ioVal, retVal));
-
+        Compile(e, _root);
         return new Program
         {
             Registers = _nextReg,
@@ -306,6 +348,10 @@ public class Compiler
             if (_scope.TryLookup(var.Name, out var slot))
             {
                 slot.Users.Add(res);
+            }
+            else if (_globals.TryGetValue(var.Name, out var global))
+            {
+                _instructions.Add(new NilaryInst(res, Port.Global(global.Index)));
             }
             else
             {
