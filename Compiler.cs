@@ -159,7 +159,7 @@ public class Compiler
     private int _nextReg = 1;
     private int _dupCount = 0;
     private List<Inst> _instructions = new List<Inst>();
-    
+
     Dictionary<string, Global> _globals = new Dictionary<string, Global>();
 
     Scope _scope = new Scope();
@@ -191,7 +191,7 @@ public class Compiler
         _instructions.Clear();
         _scope = new Scope();
     }
-    
+
     Program[] CompileModule(Module m)
     {
         foreach (var def in m.Defs)
@@ -225,7 +225,7 @@ public class Compiler
     {
         _instructions.Add(new NilaryInst(x, Port.Eraser()));
     }
-    
+
     void Val(Reg x, ExtVal v)
     {
         _instructions.Add(new NilaryInst(x, Port.FromExtVal(v)));
@@ -240,15 +240,15 @@ public class Compiler
     {
         // c = (? (? t f) res)
         var q = Gen();
-        _instructions.Add(new BinaryInst(PortKind.Branch, 0, c, q, res));
-        _instructions.Add(new BinaryInst(PortKind.Branch, 0, q, t, f));
+        _instructions.Add(new BinaryInst(PortKind.Operator, (ushort)OperatorKind.Branch, c, q, res));
+        _instructions.Add(new BinaryInst(PortKind.Operator, (ushort)OperatorKind.Branch, q, t, f));
     }
 
     void App(Reg fn, Reg arg, Reg res)
     {
         _instructions.Add(new BinaryInst(PortKind.Comb, Fn, fn, arg, res));
     }
-    
+
     void Lam(Reg prm, Reg body, Reg fn)
     {
         _instructions.Add(new BinaryInst(PortKind.Comb, Fn, fn, prm, body));
@@ -258,7 +258,7 @@ public class Compiler
     {
         _instructions.Add(new BinaryInst(PortKind.Comb, Constr, l, r, res));
     }
-    
+
     void RightChain<L, T>(Reg head, L xs, Func<T, Reg> f, Action<Reg, Reg, Reg> g, Func<Reg>? final = null) where L: IList<T>
     {
         // x0..x3 = map f xs
@@ -312,7 +312,7 @@ public class Compiler
         Compile(e, res);
         return res;
     }
-    
+
     void Compile(Expr e, Reg res)
     {
         if (e is Lit lit)
@@ -447,7 +447,7 @@ public class Compiler
             RightChain<Expr[], Expr>(res, tupe.Items, Compile, Tup);
             return;
         }
-        
+
         if (e is UntupExpr untupe)
         {
             Debug.Assert(untupe.Vars.Length >= 2);
@@ -455,7 +455,7 @@ public class Compiler
             var slots = untupe.Vars.Select(prm => _scope.Define(prm)).ToArray();
             Compile(untupe.Body, res);
             _scope = _scope.Parent;
-            
+
             // tup(e0 tup(e1 tup(e2 e3))) = t
             RightChain<Slot[], Slot>(Compile(untupe.Tup), slots, MaterializeUsers, Tup);
             return;

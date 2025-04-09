@@ -98,11 +98,17 @@ public ref struct Heap
         string[] names = p.Kind == PortKind.Comb ? ["fn", "tup", "dup"] : ["add", "seq", "print"];
         switch (p.Kind)
         {
-            case PortKind.ExtFn or PortKind.Branch or PortKind.Comb:
+            case PortKind.ExtFn or PortKind.Operator or PortKind.Comb:
                 var (s, ( lbl, f)) = p.Kind switch
                 {
                     PortKind.Comb => ("", (p.Label, false)),
-                    PortKind.Branch => ("?", ( p.Label, false)),
+                    PortKind.Operator =>
+                        p.Operator switch
+                        {
+                            OperatorKind.Branch => ("?", (p.Label, false)),
+                            OperatorKind.Lift => ("LIFT", (p.Label, false)),
+                            OperatorKind.Lower => ("LOWER", (p.Label, false)),
+                        },
                     _ => ("EFN:", p.GetExtFn()),
                 };
                 var label = $"dup{lbl-2}";

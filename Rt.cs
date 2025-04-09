@@ -92,8 +92,8 @@ public ref struct Rt
             // Annihilate
             if ((a.Kind == b.Kind && a.IsBinary && a.Label == b.Label)
                 // Copy
-                || (a.IsNilary && a.Kind != PortKind.Global && b.Kind is not (PortKind.Branch or PortKind.ExtFn))
-                || (b.IsNilary && b.Kind != PortKind.Global && a.Kind is not (PortKind.Branch or PortKind.ExtFn)))
+                || (a.IsNilary && a.Kind != PortKind.Global && b.Kind is not (PortKind.Operator or PortKind.ExtFn))
+                || (b.IsNilary && b.Kind != PortKind.Global && a.Kind is not (PortKind.Operator or PortKind.ExtFn)))
                 ActiveFast.Push((a, b));
             else
                 ActiveSlow.Push((a, b));
@@ -163,11 +163,13 @@ public ref struct Rt
             LinkWire(newFn.Aux.Left, b);
             LinkWire(newFn.Aux.Right, a.Aux.Right.ToPort());
         }
-        else if (a.Kind == PortKind.Branch && b.Kind == PortKind.ExtVal)
+        else if (a.Kind == PortKind.Operator
+                 && b.Kind == PortKind.ExtVal
+                 && a.Operator == OperatorKind.Branch)
         {
             // Branch
             Debug.Assert(!InFastPhase);
-            var newBr = Heap.AllocNode(PortKind.Branch, 0);
+            var newBr = Heap.AllocNode(PortKind.Operator, (ushort)OperatorKind.Branch);
             LinkWire(a.Aux.Left, newBr);
             var (thenW, elseW) =
                 b.ExtVal.IsTruthy ?

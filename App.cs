@@ -80,7 +80,7 @@ class Visualizer
                 PortKind.ExtFn => Color.BlueViolet,
                 PortKind.Global => Color.Cyan3,
                 PortKind.Comb => Color.Green,
-                PortKind.Branch => Color.Pink3,
+                PortKind.Operator => Color.Pink3,
                 PortKind.Eraser => Color.Red,
                 PortKind.Unassigned when port.IsFreeNode => Color.Grey11,
                 PortKind.Unassigned => Color.Grey23,
@@ -93,7 +93,13 @@ class Visualizer
                 PortKind.ExtFn => $"{port.Label&0xFF:X02}",
                 PortKind.Global => $"{port.Addr&0xFF:X02}",
                 PortKind.Comb => $"{port.Label:X02}" ,
-                PortKind.Branch => $"??",
+                PortKind.Operator =>
+                    port.Operator switch
+                    {
+                        OperatorKind.Branch => "??",
+                        OperatorKind.Lift => "^^",
+                        OperatorKind.Lower => ",,"
+                    },
                 PortKind.Eraser => "!!",
                 PortKind.Unassigned when port.IsFreeNode =>
                     port.RawValue != (ulong.MaxValue & ~0b111UL) ? "!." : "..",
@@ -172,7 +178,7 @@ class Application
             val.Drop();
             return io;
         });
-        
+
         rt.InFastPhase = false;
         rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell)));
         Console.WriteLine(rt.ToString());

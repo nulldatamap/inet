@@ -61,9 +61,17 @@ public enum PortKind
     ExtFn,
     Global,
     Comb,
-    Branch,
+    Operator,
     Wire,
     Eraser,
+}
+
+public enum OperatorKind
+{
+    Branch,
+    Lift,
+    Lower,
+    _Count,
 }
 
 public struct Cell<T> where T : unmanaged
@@ -213,6 +221,17 @@ public record struct Port
     public static Port FromExtVal(ExtVal val) => new Port(val.Raw | (ulong)PortKind.ExtVal);
     public static Port Global(ulong globalId) => new Port(PortKind.Global, 0, globalId << KIND_SHIFT);
 
+    public OperatorKind Operator
+    {
+        get
+        {
+            var l = Label;
+            Debug.Assert(Kind == PortKind.Operator);
+            Debug.Assert(Label < (int)OperatorKind._Count);
+            return (OperatorKind)l;
+        }
+    }
+
     public bool IsAssigned
     {
         get
@@ -225,7 +244,7 @@ public record struct Port
 
     public bool IsFreeNode => Kind == PortKind.Unassigned && _value != 0;
 
-    public static bool IsBinaryKind(PortKind k) => k is PortKind.Branch or PortKind.Comb or PortKind.ExtFn;
+    public static bool IsBinaryKind(PortKind k) => k is PortKind.Operator or PortKind.Comb or PortKind.ExtFn;
     public static bool IsNilaryKind(PortKind k) => k is PortKind.Eraser or PortKind.Global or PortKind.ExtVal;
 
     public bool IsBinary => IsBinaryKind(Kind);
@@ -292,8 +311,8 @@ public record struct Port
                 return _value != 0 ? "<FREE>" : "-";
             case PortKind.Comb:
                 return $"C:{Label:X02}:{_value&ADDR_MASK:X08}";
-            case PortKind.Branch:
-                return $"B:{_value&ADDR_MASK:X08}";
+            case PortKind.Operator:
+                return $"OP:{Label:X02}:{_value&ADDR_MASK:X08}";
             case PortKind.ExtVal:
                 return $"EXT:{ExtVal:X02}";
             case PortKind.ExtFn:
