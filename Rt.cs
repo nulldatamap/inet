@@ -14,7 +14,11 @@ public static class Builtins
         rt.ExtFns.Add(Seq);
     }
 
-    static ExtVal Add(ExtVal a, ExtVal b) => ExtVal.FromImm(a.Imm + b.Imm);
+    static ExtVal Add(ExtVal a, ExtVal b)
+    {
+        Debug.Assert(a.Type == b.Type && a.Type == 0);
+        return ExtVal.FromImm(a.Imm + b.Imm, a.Type);
+    }
 
     static ExtVal Seq(ExtVal a, ExtVal b)
     {

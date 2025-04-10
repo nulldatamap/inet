@@ -160,6 +160,8 @@ class Application
         var heap = new Heap(baseHeap);
         var rt = new Rt(heap);
         var log = new List<string>();
+        const ushort PortType = 0x7000;
+        const ushort IOType = 0x7001;
         Cell<ulong> ioCell = new(0);
 
         // var prog = Program.Build((bin, nil) =>
@@ -190,10 +192,7 @@ class Application
                         Expr.Untup(["x00", "x01"], Expr.Var("x0"),
                             Expr.Untup(["x10", "x11"], Expr.Var("x1"),
                                 Expr.Do(
-                                    Expr.Print(Expr.Var("io"), Expr.Var("x00")),
-                                        Expr.Print(Expr.Var("io"), Expr.Var("x01")),
-                                        Expr.Print(Expr.Var("io"), Expr.Var("x10")),
-                                        Expr.Print(Expr.Var("io"), Expr.Var("x11"))
+                                    Expr.Print(Expr.Var("io"), Var.Add(Expr.Var("x00"), Expr.Var("x11")))
                                     )))))),
             new Def("id", Expr.Lam(["x"], Expr.Var("x"))),
             new Def("pair", Expr.Lam(["x"], Expr.Tup(Expr.Var("x"), Expr.Var("x")))),
@@ -208,7 +207,7 @@ class Application
         });
 
         rt.InFastPhase = false;
-        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell)));
+        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell, IOType)));
         Console.WriteLine(rt.ToString());
 
         /*
@@ -239,7 +238,7 @@ class Application
         rt.Link(app, f);
         */
 
-        var v = new TextVisualizer();
+        var v = new TUIVisualizer();
         v.Visualize(rt, log);
         Console.ReadKey();
 

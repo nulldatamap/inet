@@ -118,8 +118,10 @@ public struct Cell<T> where T : unmanaged
 
 public readonly struct ExtVal
 {
-    private const ulong CELL_BIT = 0b1000;
+    private const ulong CELL_BIT = 0x7000;
     private const int IMM_SHIFT = 4;
+    private const int TY_SHIFT = 48;
+    private const ulong VALUE_MASK = 0x0000FFFF_FFFFFFFF;
 
     private readonly ulong _value;
 
@@ -131,18 +133,19 @@ public readonly struct ExtVal
         _value = v;
     }
 
-    public static ExtVal FromImm(ulong x)
+    public static ExtVal FromImm(ulong x, ushort ty)
     {
         var imm = x << IMM_SHIFT;
         Debug.Assert((imm >> IMM_SHIFT) == x);
-        return new ExtVal(imm);
+        Debug.Assert((ty & CELL_BIT) == 0);
+        return new ExtVal(((ulong)ty) << TY_SHIFT | imm);
     }
 
-    public static unsafe ExtVal FromRef<T>(ref Cell<T> c) where T: unmanaged
+    public static unsafe ExtVal FromRef<T>(ref Cell<T> c, ushort ty) where T: unmanaged
     {
         var addr = (ulong)c.AsPointer();
-        Debug.Assert((addr & CELL_BIT) != 0);
-        return new ExtVal(addr);
+        Debug.Assert((ty & CELL_BIT) != 0);
+        return new ExtVal(((ulong)ty << TY_SHIFT) | addr);
     }
 
     public static ExtVal FromRaw(ulong x)
@@ -152,24 +155,25 @@ public readonly struct ExtVal
 
     public ulong Raw => _value;
 
-    public bool IsImm => (_value & CELL_BIT) == 0;
+    public bool IsImm => (Type & CELL_BIT) == 0;
     public bool IsRef => !IsImm;
+    public ushort Type => (ushort)(_value >> TY_SHIFT);
 
-    public bool IsTruthy => _value != 0;
+    public bool IsTruthy => (_value & VALUE_MASK) != 0;
 
     public ulong Imm
     {
         get
         {
-            Debug.Assert((_value & CELL_BIT) == 0);
+            Debug.Assert(IsImm);
             return _value >> IMM_SHIFT;
         }
     }
 
     public unsafe ref Cell<T> Ref<T>() where T: unmanaged
     {
-        Debug.Assert((_value & CELL_BIT) != 0);
-        return ref Unsafe.AsRef<Cell<T>>(&((ulong*)_value)[-1]);
+        Debug.Assert(IsRef);
+        return ref Unsafe.AsRef<Cell<T>>(&((ulong*)(_value & VALUE_MASK))[-1]);
     }
 
     public ExtVal Dup()
@@ -193,7 +197,7 @@ public readonly struct ExtVal
         }
 
         var c = Ref<ulong>();
-        return $"@[{c.RefCount}]{_value:X08}";
+        return $"@{Type:X04}[{c.RefCount}]{_value:X08}";
     }
 }
 
