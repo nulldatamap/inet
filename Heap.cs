@@ -74,7 +74,7 @@ public ref struct Heap
             for (int i = 0; i < Head; i++)
             {
                 var p = new Port(Cells[i]);
-                sb.Append($"{(ulong)&baseAddr[i]:X08}:  {p, 16}");
+                sb.Append($"{(ulong)&baseAddr[i]:X08}:  {p, 24}");
 
                 if (!p.IsFreeNode)
                 {

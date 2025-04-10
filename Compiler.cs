@@ -187,7 +187,6 @@ public class Compiler
     void Reset()
     {
         _nextReg = 1;
-        _dupCount = 0;
         _instructions.Clear();
         _scope = new Scope();
     }

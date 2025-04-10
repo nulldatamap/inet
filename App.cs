@@ -3,12 +3,17 @@ using Spectre.Console;
 
 namespace inet;
 
-class Visualizer
+interface IVisualizer
+{
+    void Visualize(Rt rt, List<string>? log = null);
+}
+
+class TUIVisualizer : IVisualizer
 {
     public float[] WriteTimes;
     public (int Width, int Height) HeapView;
 
-    public Visualizer()
+    public TUIVisualizer()
     {
         HeapView = (16, 24);
         WriteTimes = new float[HeapView.Width * HeapView.Height];
@@ -114,6 +119,19 @@ class Visualizer
     }
 }
 
+class TextVisualizer : IVisualizer
+{
+    public void Visualize(Rt rt, List<string>? log = null)
+    {
+        Console.WriteLine(rt.ToString());
+        if (log is not null)
+            foreach (var msg in log)
+            {
+                Console.WriteLine($"- {msg}");
+            }
+    }
+}
+
 class Application
 {
     enum C
@@ -167,8 +185,18 @@ class Application
         // });
 
         rt.Globals.AddRange(Compiler.Compile(new Module([
-            new Def("main", Expr.Lam(["io"], Expr.Print(Expr.Var("io"), Expr.Call(Expr.Var("id"), Expr.I32(9))))),
-            new Def("id", Expr.Lam(["x"], Expr.Var("x")))
+            new Def("main", Expr.Lam(["io"],
+                    Expr.Untup(["x0", "x1"], Expr.Call(Expr.Var("pair"), Expr.Call(Expr.Var("pair"), Expr.I32(3))),
+                        Expr.Untup(["x00", "x01"], Expr.Var("x0"),
+                            Expr.Untup(["x10", "x11"], Expr.Var("x1"),
+                                Expr.Do(
+                                    Expr.Print(Expr.Var("io"), Expr.Var("x00")),
+                                        Expr.Print(Expr.Var("io"), Expr.Var("x01")),
+                                        Expr.Print(Expr.Var("io"), Expr.Var("x10")),
+                                        Expr.Print(Expr.Var("io"), Expr.Var("x11"))
+                                    )))))),
+            new Def("id", Expr.Lam(["x"], Expr.Var("x"))),
+            new Def("pair", Expr.Lam(["x"], Expr.Tup(Expr.Var("x"), Expr.Var("x")))),
         ])));
         rt.ExtFns.Add((io, val) =>
         {
@@ -211,7 +239,7 @@ class Application
         rt.Link(app, f);
         */
 
-        var v = new Visualizer();
+        var v = new TextVisualizer();
         v.Visualize(rt, log);
         Console.ReadKey();
 

@@ -133,15 +133,15 @@ public ref struct Rt
             var bl = Heap.AllocNode(PortKind.Comb, b.Label);
             var br = Heap.AllocNode(PortKind.Comb, b.Label);
 
-            LinkWire(b.Aux.Right, al);
-            LinkWire(b.Aux.Left, ar);
+            LinkWire(al.Aux.Left, bl.Aux.Left.ToPort());
+            LinkWire(al.Aux.Right, br.Aux.Left.ToPort());
+            LinkWire(ar.Aux.Left, bl.Aux.Right.ToPort());
+            LinkWire(ar.Aux.Right, br.Aux.Right.ToPort());
+
             LinkWire(a.Aux.Left, bl);
             LinkWire(a.Aux.Right, br);
-
-            LinkWire(al.Aux.Left, bl.Aux.Right.ToPort());
-            LinkWire(al.Aux.Right, br.Aux.Left.ToPort());
-            LinkWire(ar.Aux.Left, bl.Aux.Left.ToPort());
-            LinkWire(ar.Aux.Right, al.Aux.Right.ToPort());
+            LinkWire(b.Aux.Left, al);
+            LinkWire(b.Aux.Right, ar);
         } else if (a.Kind == PortKind.ExtFn && b.Kind == PortKind.ExtVal)
         {
             // Call
