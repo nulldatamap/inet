@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace inet;
 
@@ -79,7 +80,7 @@ public struct Cell<T> where T : unmanaged
     private long _count;
     private T _value;
 
-    public Cell(T v)
+    internal Cell(T v)
     {
         _value = v;
         _count = 1;
@@ -109,10 +110,11 @@ public struct Cell<T> where T : unmanaged
         Debug.Assert(v >= 1);
     }
 
-    public void Decrement()
+    public bool Decrement()
     {
         var v = Interlocked.Decrement(ref _count);
         Debug.Assert(v >= 0);
+        return v == 0;
     }
 }
 
@@ -141,9 +143,11 @@ public readonly struct ExtVal
         return new ExtVal(((ulong)ty) << TY_SHIFT | imm);
     }
 
-    public static unsafe ExtVal FromRef<T>(ref Cell<T> c, ushort ty) where T: unmanaged
+    public static unsafe ExtVal MakeRef<T>(T v, ushort ty) where T: unmanaged
     {
-        var addr = (ulong)c.AsPointer();
+        var ptr = (Cell<T>*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<Cell<T>>(), 16);
+        *ptr = new Cell<T>(v);
+        var addr = (ulong)&((ulong*)ptr)[1];
         Debug.Assert((ty & CELL_BIT) != 0);
         return new ExtVal(((ulong)ty << TY_SHIFT) | addr);
     }
@@ -170,10 +174,12 @@ public readonly struct ExtVal
         }
     }
 
+    unsafe void* GetCellPointer() => &((ulong*)(_value & VALUE_MASK))[-1];
+
     public unsafe ref Cell<T> Ref<T>() where T: unmanaged
     {
         Debug.Assert(IsRef);
-        return ref Unsafe.AsRef<Cell<T>>(&((ulong*)(_value & VALUE_MASK))[-1]);
+        return ref Unsafe.AsRef<Cell<T>>(GetCellPointer());
     }
 
     public ExtVal Dup()
@@ -186,7 +192,13 @@ public readonly struct ExtVal
     public void Drop()
     {
         if (IsRef)
-            Ref<ulong>().Decrement();
+        {
+            unsafe
+            {
+                if (Ref<ulong>().Decrement())
+                    NativeMemory.AlignedFree(GetCellPointer());
+            }
+        }
     }
 
     public override string ToString()

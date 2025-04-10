@@ -162,7 +162,6 @@ class Application
         var log = new List<string>();
         const ushort PortType = 0x7000;
         const ushort IOType = 0x7001;
-        Cell<ulong> ioCell = new(0);
 
         // var prog = Program.Build((bin, nil) =>
         // {
@@ -207,7 +206,7 @@ class Application
         });
 
         rt.InFastPhase = false;
-        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.FromRef(ref ioCell, IOType)));
+        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.MakeRef(0UL, IOType)));
         Console.WriteLine(rt.ToString());
 
         /*
@@ -270,6 +269,5 @@ class Application
                 break;
             }
         }
-        Debug.Assert(ioCell.RefCount == 0);
     }
 }
