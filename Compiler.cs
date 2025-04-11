@@ -17,6 +17,7 @@ public abstract class Expr
     public static TupExpr Tup(params Expr[] es) => new (es);
     public static UntupExpr Untup(string[] xs, Expr t, Expr b) => new (xs, t, b);
     public static PrintExpr Print(Expr io, Expr val) => new(io, val);
+    public static ExtCallExpr ExtCall(ushort id, Expr a, Expr b) => new(id, a, b);
     // public static InlineExpr Inline(Func<Reg[], Inst[]> insts, params Expr[] es) => new bool(insts, es);
 }
 
@@ -86,6 +87,13 @@ public sealed class UntupExpr(string[] xs, Expr tup, Expr body) : Expr
     public readonly string[] Vars = xs;
     public readonly Expr Tup = tup;
     public readonly Expr Body = body;
+}
+
+public sealed class ExtCallExpr(ushort id, Expr a, Expr b) : Expr
+{
+    public readonly ushort ExtFnId = id;
+    public readonly Expr Left = a;
+    public readonly Expr Right = b;
 }
 
 public class Def(string name, Expr body)
@@ -465,6 +473,15 @@ public class Compiler
             ExtFn(TEMP_PRINT,
                 Compile(print.Io),
                 Compile(print.Val),
+                res);
+            return;
+        }
+
+        if (e is ExtCallExpr extCall)
+        {
+            ExtFn(extCall.ExtFnId,
+                Compile(extCall.Left),
+                Compile(extCall.Right),
                 res);
             return;
         }

@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace  inet;
@@ -20,18 +21,18 @@ public static class Builtins
         return ExtVal.FromImm(Rt.I32Ty, a.Imm + b.Imm);
     }
 
-    static ExtVal Seq(ExtVal a, ExtVal b)
+    static ExtVal Seq(ref Rt rt, ExtVal a, ExtVal b)
     {
-        b.Drop();
+        b.Drop(rt);
         return a;
     }
 }
 
 public ref struct Rt
 {
-    public static readonly ExtTy I32Ty = new ExtTy(ExtTyKind.Imm, 0);
-    public static readonly ExtTy IOTy = new ExtTy(ExtTyKind.Ref, 0);
-    public static readonly ExtTy PortTy = new ExtTy(ExtTyKind.Uniq, 0);
+    public static readonly ExtTy I32Ty = new ExtTy(ExtTyFlags.Imm, 0);
+    public static readonly ExtTy IOTy = new ExtTy(ExtTyFlags.Ref, 0);
+    public static readonly ExtTy PortTy = new ExtTy(ExtTyFlags.Uniq, 0);
 
     public Heap Heap;
     public readonly Stack<(Port, Port)> ActiveFast = new();
@@ -42,19 +43,60 @@ public ref struct Rt
     public bool InFastPhase = true;
 
     readonly List<Port> _registers = new();
-    private ushort _nextImmType = 1;
-    private ushort _nextRefType = 1;
-    private ushort _nextUniqType = 1;
+
+    readonly List<ExtTyDesc> _immTypeDescs = [ExtTyDesc.Imm("i32")];
+    readonly List<ExtTyDesc> _refTypeDescs = [ExtTyDesc.Ref<ulong>("io")];
+    readonly List<ExtTyDesc> _uniqTypeDescs = [
+        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<ulong>(), false, DisallowDup, DisallowDrop)
+    ];
+
+    public static void DisallowDup(ref ExtVal self)
+        => throw new InvalidOperationException($"`{self}` is not a duplicatable type");
+
+    public static bool DisallowDrop(ref ExtVal self)
+        => throw new InvalidOperationException($"`{self}` is not a dropable type");
+
+    public static bool DropOnce(ref ExtVal self) => true;
+
+    public ExtTy NewImmTy(string name)
+    {
+        var id = _immTypeDescs.Count;
+        _immTypeDescs.Add(ExtTyDesc.Imm(name));
+        return new ExtTy(ExtTyFlags.Imm, (ushort)id);
+    }
+
+    public ExtTy NewRefTy<T>(string name) where T : unmanaged
+    {
+        var id = _refTypeDescs.Count;
+        _refTypeDescs.Add(ExtTyDesc.Ref<T>(name));
+        return new ExtTy(ExtTyFlags.Ref, (ushort)id);
+    }
+
+    public ExtTy NewUniqTy<T>(string name, ExtTyDesc.DupF? dup = null, ExtTyDesc.DropF? drop = null) where T : unmanaged
+    {
+        var id = _uniqTypeDescs.Count;
+        _uniqTypeDescs.Add(new ExtTyDesc(name, Immediate: false, (uint)Unsafe.SizeOf<T>(), Dup: dup ?? DisallowDup, Drop: drop ?? DisallowDrop));
+        return new ExtTy(ExtTyFlags.Uniq, (ushort)id);
+    }
+
+    public ExtTyDesc GetTypeDesc(ExtTy ty)
+    {
+        var descs = ty.Flags switch
+        {
+            ExtTyFlags.Imm => _immTypeDescs,
+            ExtTyFlags.Ref => _refTypeDescs,
+            ExtTyFlags.Uniq => _uniqTypeDescs,
+            _ => throw new InvalidOperationException($"Invalid type flags: {ty.Flags}"),
+        };
+        Debug.Assert(ty.TypeIndex < descs.Count);
+        return descs[ty.TypeIndex];
+    }
 
     public Rt(Heap h)
     {
         Heap = h;
         Builtins.RegisterBuiltins(ref this);
     }
-
-    public ExtTy NewImmTy() => new ExtTy(ExtTyKind.Imm, _nextImmType++);
-    public ExtTy NewRefTy() => new ExtTy(ExtTyKind.Ref, _nextRefType++);
-    public ExtTy NewUniqTy() => new ExtTy(ExtTyKind.Uniq, _nextUniqType++);
 
     private void FreeWire(Wire w)
     {

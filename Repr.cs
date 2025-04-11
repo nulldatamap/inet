@@ -75,7 +75,13 @@ public enum OperatorKind
     _Count,
 }
 
-public struct Cell<T> where T : unmanaged
+interface IRefCounted
+{
+    public void Increment();
+    public bool Decrement();
+}
+
+public struct Cell<T> : IRefCounted where T : unmanaged
 {
     private long _count;
     private T _value;
@@ -117,25 +123,85 @@ public struct Cell<T> where T : unmanaged
     }
 }
 
-public enum ExtTyKind
+public struct Slots : IRefCounted
 {
-    Imm = 0b00,
-    Ref = 0b10,
-    Uniq = 0b11,
+    private uint _count;
+    private uint _length;
+
+    internal Slots(uint length)
+    {
+        _count = 1;
+        _length = length;
+    }
+
+    public unsafe ExtVal* AsPointer() => (ExtVal*)(&((ulong*)Unsafe.AsPointer(ref _length))[1]);
+    public unsafe Span<ExtVal> AsSpan() => new Span<ExtVal>(AsPointer(), (int)_length);
+
+    public long RefCount => _count;
+
+    public void Increment()
+    {
+        var v = Interlocked.Increment(ref _count);
+        Debug.Assert(v >= 1);
+    }
+
+    public bool Decrement()
+    {
+        var v = Interlocked.Decrement(ref _count);
+        var shouldFree = v == 0;
+        if (shouldFree)
+        {
+            var span = AsSpan();
+            for (int i = 0; i < span.Length; i++)
+            {
+                span[i].Drop();
+            }
+        }
+
+        return shouldFree;
+    }
+}
+
+public enum ExtTyFlags
+{
+    None = 0b00,
+    RefCounted = 0b01,
+    DupDropOverload = 0b10,
+
+    Imm = None,
+    Ref = RefCounted,
+    Uniq = RefCounted | DupDropOverload,
+}
+
+public readonly record struct ExtTyDesc(
+    string Name,
+    bool Immediate,
+    uint Size = 0,
+    bool Dynamic = false,
+    ExtTyDesc.DupF? Dup = null,
+    ExtTyDesc.DropF Drop = null)
+{
+    public delegate void DupF(ref ExtVal self);
+
+    public delegate bool DropF(ref ExtVal self);
+
+    public static ExtTyDesc Imm(string name)
+        => new ExtTyDesc(name, Immediate: true);
+
+    public static ExtTyDesc Ref<T>(string name) where T : unmanaged
+        => new ExtTyDesc(name, Immediate: false, Size: (uint)Unsafe.SizeOf<T>());
 }
 
 public readonly record struct ExtTy
 {
     private const ushort FLAG_MASK = 0xc000;
     private const int FLAG_SHIFT = 14;
-    private const ushort CELL_BIT = 0x8000;
-    private const ushort UNIQUE_BIT = 0x4000;
 
     private readonly ushort _value;
 
-    public ExtTy(ExtTyKind kind, ushort id)
+    public ExtTy(ExtTyFlags flags, ushort id)
     {
-        _value = (ushort)(id | (((ushort)kind) << FLAG_SHIFT));
+        _value = (ushort)(id | (((ushort)flags) << FLAG_SHIFT));
         Debug.Assert((_value & ~FLAG_MASK) == id);
     }
 
@@ -146,7 +212,8 @@ public readonly record struct ExtTy
         return new ExtTy(v);
     }
 
-    public ExtTyKind Kind => (ExtTyKind)(_value >> FLAG_SHIFT);
+    public ushort TypeIndex => (ushort)(_value & ~FLAG_MASK);
+    public ExtTyFlags Flags => (ExtTyFlags)(_value >> FLAG_SHIFT);
     public ushort Raw => _value;
 }
 
@@ -176,18 +243,41 @@ public readonly struct ExtVal
     {
         var imm = x << IMM_SHIFT;
         Debug.Assert((imm >> IMM_SHIFT) == x);
-        Debug.Assert(ty.Kind == ExtTyKind.Imm);
+        Debug.Assert(ty.Flags == ExtTyFlags.Imm);
         return new ExtVal(ty, imm);
     }
 
-    public static unsafe ExtVal MakeRef<T>(ExtTy ty, T v) where T: unmanaged
+    public static unsafe ExtVal MakeRef<T>(ExtTy ty, T v, nuint extraPayloadSize = 0) where T: unmanaged
     {
-        var ptr = (Cell<T>*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<Cell<T>>(), 16);
+        var ptr = (Cell<T>*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<Cell<T>>() + extraPayloadSize, 16);
         *ptr = new Cell<T>(v);
-        var addr = (ulong)&((ulong*)ptr)[1];
-        Debug.Assert(ty.Kind == ExtTyKind.Ref);
-        return new ExtVal(ty, addr);
+        Debug.Assert(ty.Flags == ExtTyFlags.Ref);
+        return new ExtVal(ty, (ulong)ptr);
     }
+
+    public static unsafe ExtVal MakeUniq<T>(ExtTy ty, T v, nuint extraPayloadSize = 0) where T: unmanaged
+    {
+        var ptr = (T*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<T>() + extraPayloadSize, 16);
+        Debug.Assert(ty.Flags == ExtTyFlags.Uniq);
+        return new ExtVal(ty, (ulong)ptr);
+    }
+
+    private static unsafe ref Slots AllocArray(uint count, bool zeroUnit)
+    {
+        var ptr = (Slots*)NativeMemory.AlignedAlloc((nuint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * count), 16);
+        if (zeroUnit)
+        {
+            for (var i = 0; i < count; i++) ptr->AsSpan()[i] = Nil;
+        }
+        return ref Unsafe.AsRef<Slots>(ptr);
+    }
+
+    // public static unsafe ExtVal MakeArray(ExtTy ty, uint length)
+    // {
+    //     Debug.Assert(ty.Flags == ExtTyFlags.Array);
+    //     ref var slots = ref AllocArray(length, zeroUnit: false);
+    //     return new ExtVal(ty, (ulong)Unsafe.AsPointer(ref slots));
+    // }
 
     public static ExtVal FromRaw(ulong x)
     {
@@ -196,9 +286,9 @@ public readonly struct ExtVal
 
     public ulong Raw => _value;
 
-    public bool IsImm => Type.Kind == ExtTyKind.Imm;
-    public bool IsRef => Type.Kind == ExtTyKind.Ref;
-    public bool IsUniq => Type.Kind == ExtTyKind.Uniq;
+    public bool IsImm => Type.Flags == ExtTyFlags.Imm;
+    public bool IsRef => Type.Flags == ExtTyFlags.Ref;
+    public bool IsUniq => Type.Flags == ExtTyFlags.Uniq;
     public ExtTy Type => ExtTy.FromRaw((ushort)(_value >> TY_SHIFT));
 
     public bool IsTruthy => (_value & VALUE_MASK) != 0;
@@ -212,35 +302,45 @@ public readonly struct ExtVal
         }
     }
 
-    unsafe void* GetCellPointer() => &((ulong*)(_value & VALUE_MASK))[-1];
-    unsafe void* GetUniqPointer() => (void*)(_value & VALUE_MASK);
+    unsafe void* GetPointer() => (void*)(_value & VALUE_MASK);
 
     public unsafe ref Cell<T> Ref<T>() where T: unmanaged
     {
         Debug.Assert(IsRef);
-        return ref Unsafe.AsRef<Cell<T>>(GetCellPointer());
+        return ref Unsafe.AsRef<Cell<T>>(GetPointer());
     }
 
-    public ExtVal Dup()
+    public ExtVal Dup(ref Rt rt)
     {
+        if (Type.Flags.HasFlag(ExtTyFlags.DupDropOverload))
+        {
+            var self = this;
+            var desc = rt.GetTypeDesc(Type);
+            desc.Dup(ref self);
+            return self;
+        }
+
         if (IsRef)
             Ref<ulong>().Increment();
-        else if (IsUniq)
-            throw new InvalidOperationException($"Tried to duplicate unique value {this}");
         return this;
     }
 
-    public void Drop()
+    public void Drop(ref Rt rt)
     {
         unsafe
         {
+            if (Type.Flags.HasFlag(ExtTyFlags.DupDropOverload))
+            {
+                var self = this;
+                var desc = rt.GetTypeDesc(Type);
+                if (desc.Drop(ref self))
+                    NativeMemory.AlignedFree(GetPointer());
+                return;
+            }
             if (IsRef)
             {
                 if (Ref<ulong>().Decrement())
-                    NativeMemory.AlignedFree(GetCellPointer());
-            } else if (IsUniq)
-            {
-                NativeMemory.AlignedFree(GetUniqPointer());
+                    NativeMemory.AlignedFree(GetPointer());
             }
         }
     }
@@ -313,17 +413,17 @@ public record struct Port
     public bool IsBinary => IsBinaryKind(Kind);
     public bool IsNilary => IsNilaryKind(Kind);
 
-    public Port Dup()
+    public Port Dup(ref Rt rt)
     {
         if (Kind == PortKind.ExtVal)
-            return FromExtVal(ExtVal.Dup());
+            return FromExtVal(ExtVal.Dup(ref rt));
         return this;
     }
 
-    public void Drop()
+    public void Drop(ref Rt rt)
     {
         if (Kind == PortKind.ExtVal)
-            ExtVal.Drop();
+            ExtVal.Drop(ref rt);
     }
 
     public (Wire Left, Wire Right) Aux

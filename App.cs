@@ -160,6 +160,7 @@ class Application
         var heap = new Heap(baseHeap);
         var rt = new Rt(heap);
         var log = new List<string>();
+        var moneyTy = rt.NewUniqTy<ulong>("money", drop: Rt.DropOnce);
 
         // var prog = Program.Build((bin, nil) =>
         // {
@@ -185,7 +186,7 @@ class Application
 
         rt.Globals.AddRange(Compiler.Compile(new Module([
             new Def("main", Expr.Lam(["io"],
-                    Expr.Untup(["x0", "x1"], Expr.Call(Expr.Var("pair"), Expr.Call(Expr.Var("pair"), Expr.I32(3))),
+                    Expr.Untup(["x0", "x1"], Expr.Call(Expr.Var("pair"), Expr.Call(Expr.Var("pair"), Expr.ExtCall(3, Expr.I32(3), Expr.I32(0)))),
                         Expr.Untup(["x00", "x01"], Expr.Var("x0"),
                             Expr.Untup(["x10", "x11"], Expr.Var("x1"),
                                 Expr.Do(
@@ -202,6 +203,12 @@ class Application
             log.Add($"PRINT[{io}]: {val}");
             val.Drop();
             return io;
+        });
+        rt.ExtFns.Add((amount, unused) =>
+        {
+            unused.Drop();
+            Debug.Assert(amount.Type == Rt.I32Ty);
+            return ExtVal.MakeUniq(moneyTy, amount.Imm);
         });
 
         rt.InFastPhase = false;
