@@ -160,8 +160,6 @@ class Application
         var heap = new Heap(baseHeap);
         var rt = new Rt(heap);
         var log = new List<string>();
-        const ushort PortType = 0x7000;
-        const ushort IOType = 0x7001;
 
         // var prog = Program.Build((bin, nil) =>
         // {
@@ -198,6 +196,7 @@ class Application
         ])));
         rt.ExtFns.Add((io, val) =>
         {
+            Debug.Assert(io.Type == Rt.IOTy);
             ref var ioVal = ref io.Ref<ulong>();
             ioVal.Value++;
             log.Add($"PRINT[{io}]: {val}");
@@ -206,7 +205,7 @@ class Application
         });
 
         rt.InFastPhase = false;
-        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.MakeRef(0UL, IOType)));
+        rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.MakeRef(Rt.IOTy, 0UL)));
         Console.WriteLine(rt.ToString());
 
         /*

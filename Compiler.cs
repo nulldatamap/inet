@@ -23,7 +23,7 @@ public abstract class Expr
 public sealed class Lit(int v) : Expr
 {
     public readonly int Value = v;
-    public ExtVal Repr => ExtVal.FromImm((ulong)(((long)Value) & 0xFFFFFFFFL), 0);
+    public ExtVal Repr => ExtVal.FromImm(Rt.I32Ty, (ulong)(((long)Value) & 0xFFFFFFFFL));
 }
 
 public sealed class IfExpr(Expr c, Expr t, Expr e) : Expr

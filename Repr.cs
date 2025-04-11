@@ -113,14 +113,45 @@ public struct Cell<T> where T : unmanaged
     public bool Decrement()
     {
         var v = Interlocked.Decrement(ref _count);
-        Debug.Assert(v >= 0);
         return v == 0;
     }
 }
 
+public enum ExtTyKind
+{
+    Imm = 0b00,
+    Ref = 0b10,
+    Uniq = 0b11,
+}
+
+public readonly record struct ExtTy
+{
+    private const ushort FLAG_MASK = 0xc000;
+    private const int FLAG_SHIFT = 14;
+    private const ushort CELL_BIT = 0x8000;
+    private const ushort UNIQUE_BIT = 0x4000;
+
+    private readonly ushort _value;
+
+    public ExtTy(ExtTyKind kind, ushort id)
+    {
+        _value = (ushort)(id | (((ushort)kind) << FLAG_SHIFT));
+        Debug.Assert((_value & ~FLAG_MASK) == id);
+    }
+
+    private ExtTy(ushort value) => _value = value;
+
+    public static ExtTy FromRaw(ushort v)
+    {
+        return new ExtTy(v);
+    }
+
+    public ExtTyKind Kind => (ExtTyKind)(_value >> FLAG_SHIFT);
+    public ushort Raw => _value;
+}
+
 public readonly struct ExtVal
 {
-    private const ulong CELL_BIT = 0x7000;
     private const int IMM_SHIFT = 4;
     private const int TY_SHIFT = 48;
     private const ulong VALUE_MASK = 0x0000FFFF_FFFFFFFF;
@@ -129,27 +160,33 @@ public readonly struct ExtVal
 
     public static readonly ExtVal Nil = default;
 
-    ExtVal(ulong v)
+    ExtVal(ExtTy ty, ulong v)
     {
         Debug.Assert((v & 0b111) == 0);
-        _value = v;
+        _value = v | ((ulong)ty.Raw << TY_SHIFT);
     }
 
-    public static ExtVal FromImm(ulong x, ushort ty)
+    ExtVal(ulong raw)
+    {
+        Debug.Assert((raw & 0b111) == 0);
+        _value = raw;
+    }
+
+    public static ExtVal FromImm(ExtTy ty, ulong x)
     {
         var imm = x << IMM_SHIFT;
         Debug.Assert((imm >> IMM_SHIFT) == x);
-        Debug.Assert((ty & CELL_BIT) == 0);
-        return new ExtVal(((ulong)ty) << TY_SHIFT | imm);
+        Debug.Assert(ty.Kind == ExtTyKind.Imm);
+        return new ExtVal(ty, imm);
     }
 
-    public static unsafe ExtVal MakeRef<T>(T v, ushort ty) where T: unmanaged
+    public static unsafe ExtVal MakeRef<T>(ExtTy ty, T v) where T: unmanaged
     {
         var ptr = (Cell<T>*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<Cell<T>>(), 16);
         *ptr = new Cell<T>(v);
         var addr = (ulong)&((ulong*)ptr)[1];
-        Debug.Assert((ty & CELL_BIT) != 0);
-        return new ExtVal(((ulong)ty << TY_SHIFT) | addr);
+        Debug.Assert(ty.Kind == ExtTyKind.Ref);
+        return new ExtVal(ty, addr);
     }
 
     public static ExtVal FromRaw(ulong x)
@@ -159,9 +196,10 @@ public readonly struct ExtVal
 
     public ulong Raw => _value;
 
-    public bool IsImm => (Type & CELL_BIT) == 0;
-    public bool IsRef => !IsImm;
-    public ushort Type => (ushort)(_value >> TY_SHIFT);
+    public bool IsImm => Type.Kind == ExtTyKind.Imm;
+    public bool IsRef => Type.Kind == ExtTyKind.Ref;
+    public bool IsUniq => Type.Kind == ExtTyKind.Uniq;
+    public ExtTy Type => ExtTy.FromRaw((ushort)(_value >> TY_SHIFT));
 
     public bool IsTruthy => (_value & VALUE_MASK) != 0;
 
@@ -175,6 +213,7 @@ public readonly struct ExtVal
     }
 
     unsafe void* GetCellPointer() => &((ulong*)(_value & VALUE_MASK))[-1];
+    unsafe void* GetUniqPointer() => (void*)(_value & VALUE_MASK);
 
     public unsafe ref Cell<T> Ref<T>() where T: unmanaged
     {
@@ -186,17 +225,22 @@ public readonly struct ExtVal
     {
         if (IsRef)
             Ref<ulong>().Increment();
+        else if (IsUniq)
+            throw new InvalidOperationException($"Tried to duplicate unique value {this}");
         return this;
     }
 
     public void Drop()
     {
-        if (IsRef)
+        unsafe
         {
-            unsafe
+            if (IsRef)
             {
                 if (Ref<ulong>().Decrement())
                     NativeMemory.AlignedFree(GetCellPointer());
+            } else if (IsUniq)
+            {
+                NativeMemory.AlignedFree(GetUniqPointer());
             }
         }
     }
@@ -208,8 +252,11 @@ public readonly struct ExtVal
             return $"{Imm}";
         }
 
-        var c = Ref<ulong>();
-        return $"@{Type:X04}[{c.RefCount}]{_value:X08}";
+        if (IsUniq)
+            return $@"{Type.Raw:X04}[*]{_value:X08}";
+
+        ref var c = ref Ref<ulong>();
+        return $"@{Type.Raw:X04}[{c.RefCount}]{_value:X08}";
     }
 }
 

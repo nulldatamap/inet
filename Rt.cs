@@ -16,8 +16,8 @@ public static class Builtins
 
     static ExtVal Add(ExtVal a, ExtVal b)
     {
-        Debug.Assert(a.Type == b.Type && a.Type == 0);
-        return ExtVal.FromImm(a.Imm + b.Imm, a.Type);
+        Debug.Assert(a.Type == b.Type && a.Type == Rt.I32Ty);
+        return ExtVal.FromImm(Rt.I32Ty, a.Imm + b.Imm);
     }
 
     static ExtVal Seq(ExtVal a, ExtVal b)
@@ -29,6 +29,10 @@ public static class Builtins
 
 public ref struct Rt
 {
+    public static readonly ExtTy I32Ty = new ExtTy(ExtTyKind.Imm, 0);
+    public static readonly ExtTy IOTy = new ExtTy(ExtTyKind.Ref, 0);
+    public static readonly ExtTy PortTy = new ExtTy(ExtTyKind.Uniq, 0);
+
     public Heap Heap;
     public readonly Stack<(Port, Port)> ActiveFast = new();
     public readonly Stack<(Port, Port)> ActiveSlow = new();
@@ -38,12 +42,19 @@ public ref struct Rt
     public bool InFastPhase = true;
 
     readonly List<Port> _registers = new();
+    private ushort _nextImmType = 1;
+    private ushort _nextRefType = 1;
+    private ushort _nextUniqType = 1;
 
     public Rt(Heap h)
     {
         Heap = h;
         Builtins.RegisterBuiltins(ref this);
     }
+
+    public ExtTy NewImmTy() => new ExtTy(ExtTyKind.Imm, _nextImmType++);
+    public ExtTy NewRefTy() => new ExtTy(ExtTyKind.Ref, _nextRefType++);
+    public ExtTy NewUniqTy() => new ExtTy(ExtTyKind.Uniq, _nextUniqType++);
 
     private void FreeWire(Wire w)
     {
