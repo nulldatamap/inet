@@ -77,8 +77,8 @@ public enum OperatorKind
 
 interface IRefCounted
 {
-    public void Increment();
-    public bool Decrement();
+    public void Increment(ref Rt rt);
+    public bool Decrement(ref Rt rt);
 }
 
 public struct Cell<T> : IRefCounted where T : unmanaged
@@ -110,13 +110,13 @@ public struct Cell<T> : IRefCounted where T : unmanaged
 
     public long RefCount => _count;
 
-    public void Increment()
+    public void Increment(ref Rt rt)
     {
         var v = Interlocked.Increment(ref _count);
         Debug.Assert(v >= 1);
     }
 
-    public bool Decrement()
+    public bool Decrement(ref Rt rt)
     {
         var v = Interlocked.Decrement(ref _count);
         return v == 0;
@@ -127,6 +127,8 @@ public struct Slots : IRefCounted
 {
     private uint _count;
     private uint _length;
+    
+    public uint Length => _length;
 
     internal Slots(uint length)
     {
@@ -134,18 +136,58 @@ public struct Slots : IRefCounted
         _length = length;
     }
 
-    public unsafe ExtVal* AsPointer() => (ExtVal*)(&((ulong*)Unsafe.AsPointer(ref _length))[1]);
+    public static unsafe ref Slots Alloc(uint length)
+    {
+        var ptr = (Slots*)NativeMemory.AlignedAlloc((nuint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * length), 16);
+        ptr->_count = 1;
+        ptr->_length = length;
+        return ref Unsafe.AsRef<Slots>(ptr);
+    }
+
+    public unsafe ExtVal* AsPointer() => (ExtVal*)&((Slots*)Unsafe.AsPointer(ref this))[1];
     public unsafe Span<ExtVal> AsSpan() => new Span<ExtVal>(AsPointer(), (int)_length);
 
     public long RefCount => _count;
 
-    public void Increment()
+    public static void Increment(ref Rt rt, ref ExtVal self)
+    {
+        unsafe
+        {
+            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
+            slots.Increment(ref rt);
+        }
+    }
+
+    public static bool Decrement(ref Rt rt, ref ExtVal self)
+    {
+        unsafe
+        {
+            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
+            return slots.Decrement(ref rt);
+        }
+    }
+
+    public static uint GetSize(ref Rt rt, ref ExtVal self)
+    {
+        unsafe
+        {
+            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
+            return slots.GetSize(ref rt);
+        }
+    }
+
+    public uint GetSize(ref Rt rt)
+    {
+        return (uint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * _length);
+    }
+
+    public void Increment(ref Rt rt)
     {
         var v = Interlocked.Increment(ref _count);
         Debug.Assert(v >= 1);
     }
 
-    public bool Decrement()
+    public bool Decrement(ref Rt rt)
     {
         var v = Interlocked.Decrement(ref _count);
         var shouldFree = v == 0;
@@ -154,7 +196,7 @@ public struct Slots : IRefCounted
             var span = AsSpan();
             for (int i = 0; i < span.Length; i++)
             {
-                span[i].Drop();
+                span[i].Drop(ref rt);
             }
         }
 
@@ -162,6 +204,7 @@ public struct Slots : IRefCounted
     }
 }
 
+[Flags]
 public enum ExtTyFlags
 {
     None = 0b00,
@@ -170,7 +213,7 @@ public enum ExtTyFlags
 
     Imm = None,
     Ref = RefCounted,
-    Uniq = RefCounted | DupDropOverload,
+    Uniq = DupDropOverload,
 }
 
 public readonly record struct ExtTyDesc(
@@ -179,11 +222,13 @@ public readonly record struct ExtTyDesc(
     uint Size = 0,
     bool Dynamic = false,
     ExtTyDesc.DupF? Dup = null,
-    ExtTyDesc.DropF Drop = null)
+    ExtTyDesc.DropF? Drop = null,
+    ExtTyDesc.GetSizeF? GetSize = null)
 {
-    public delegate void DupF(ref ExtVal self);
+    public delegate void DupF(ref Rt rt, ref ExtVal self);
 
-    public delegate bool DropF(ref ExtVal self);
+    public delegate bool DropF(ref Rt rt, ref ExtVal self);
+    public delegate uint GetSizeF(ref Rt rt, ref ExtVal self);
 
     public static ExtTyDesc Imm(string name)
         => new ExtTyDesc(name, Immediate: true);
@@ -262,22 +307,13 @@ public readonly struct ExtVal
         return new ExtVal(ty, (ulong)ptr);
     }
 
-    private static unsafe ref Slots AllocArray(uint count, bool zeroUnit)
+    public static ExtVal MakeArray(ref Slots slots)
     {
-        var ptr = (Slots*)NativeMemory.AlignedAlloc((nuint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * count), 16);
-        if (zeroUnit)
+        unsafe
         {
-            for (var i = 0; i < count; i++) ptr->AsSpan()[i] = Nil;
+            return new ExtVal(Rt.ArrayTy, (ulong)Unsafe.AsPointer(ref slots));
         }
-        return ref Unsafe.AsRef<Slots>(ptr);
     }
-
-    // public static unsafe ExtVal MakeArray(ExtTy ty, uint length)
-    // {
-    //     Debug.Assert(ty.Flags == ExtTyFlags.Array);
-    //     ref var slots = ref AllocArray(length, zeroUnit: false);
-    //     return new ExtVal(ty, (ulong)Unsafe.AsPointer(ref slots));
-    // }
 
     public static ExtVal FromRaw(ulong x)
     {
@@ -302,12 +338,18 @@ public readonly struct ExtVal
         }
     }
 
-    unsafe void* GetPointer() => (void*)(_value & VALUE_MASK);
+    public unsafe void* GetPointer() => (void*)(_value & VALUE_MASK);
 
     public unsafe ref Cell<T> Ref<T>() where T: unmanaged
     {
         Debug.Assert(IsRef);
         return ref Unsafe.AsRef<Cell<T>>(GetPointer());
+    }
+
+    public unsafe ref Slots Array()
+    {
+        Debug.Assert(Type == Rt.ArrayTy);
+        return ref Unsafe.AsRef<Slots>(GetPointer());
     }
 
     public ExtVal Dup(ref Rt rt)
@@ -316,12 +358,12 @@ public readonly struct ExtVal
         {
             var self = this;
             var desc = rt.GetTypeDesc(Type);
-            desc.Dup(ref self);
+            desc.Dup(ref rt, ref self);
             return self;
         }
 
         if (IsRef)
-            Ref<ulong>().Increment();
+            Ref<ulong>().Increment(ref rt);
         return this;
     }
 
@@ -333,13 +375,13 @@ public readonly struct ExtVal
             {
                 var self = this;
                 var desc = rt.GetTypeDesc(Type);
-                if (desc.Drop(ref self))
+                if (desc.Drop(ref rt, ref self))
                     NativeMemory.AlignedFree(GetPointer());
                 return;
             }
             if (IsRef)
             {
-                if (Ref<ulong>().Decrement())
+                if (Ref<ulong>().Decrement(ref rt))
                     NativeMemory.AlignedFree(GetPointer());
             }
         }

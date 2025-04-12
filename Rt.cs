@@ -15,7 +15,7 @@ public static class Builtins
         rt.ExtFns.Add(Seq);
     }
 
-    static ExtVal Add(ExtVal a, ExtVal b)
+    static ExtVal Add(ref Rt rt, ExtVal a, ExtVal b)
     {
         Debug.Assert(a.Type == b.Type && a.Type == Rt.I32Ty);
         return ExtVal.FromImm(Rt.I32Ty, a.Imm + b.Imm);
@@ -23,7 +23,7 @@ public static class Builtins
 
     static ExtVal Seq(ref Rt rt, ExtVal a, ExtVal b)
     {
-        b.Drop(rt);
+        b.Drop(ref rt);
         return a;
     }
 }
@@ -33,12 +33,15 @@ public ref struct Rt
     public static readonly ExtTy I32Ty = new ExtTy(ExtTyFlags.Imm, 0);
     public static readonly ExtTy IOTy = new ExtTy(ExtTyFlags.Ref, 0);
     public static readonly ExtTy PortTy = new ExtTy(ExtTyFlags.Uniq, 0);
+    public static readonly ExtTy ArrayTy = new ExtTy(ExtTyFlags.Uniq, 1);
+    
+    public delegate ExtVal ExtFnF(ref Rt rt, ExtVal a, ExtVal b);
 
     public Heap Heap;
     public readonly Stack<(Port, Port)> ActiveFast = new();
     public readonly Stack<(Port, Port)> ActiveSlow = new();
     public readonly List<Program> Globals = new();
-    public readonly List<Func<ExtVal, ExtVal, ExtVal>> ExtFns = new();
+    public readonly List<ExtFnF> ExtFns = new();
 
     public bool InFastPhase = true;
 
@@ -47,16 +50,17 @@ public ref struct Rt
     readonly List<ExtTyDesc> _immTypeDescs = [ExtTyDesc.Imm("i32")];
     readonly List<ExtTyDesc> _refTypeDescs = [ExtTyDesc.Ref<ulong>("io")];
     readonly List<ExtTyDesc> _uniqTypeDescs = [
-        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<ulong>(), false, DisallowDup, DisallowDrop)
+        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<ulong>(), false, DisallowDup, DisallowDrop),
+        new ExtTyDesc("array", Immediate: false, (uint)Unsafe.SizeOf<Slots>(), true, Slots.Increment, Slots.Decrement, Slots.GetSize)
     ];
 
-    public static void DisallowDup(ref ExtVal self)
+    public static void DisallowDup(ref Rt rt, ref ExtVal self)
         => throw new InvalidOperationException($"`{self}` is not a duplicatable type");
 
-    public static bool DisallowDrop(ref ExtVal self)
+    public static bool DisallowDrop(ref Rt rt, ref ExtVal self)
         => throw new InvalidOperationException($"`{self}` is not a dropable type");
 
-    public static bool DropOnce(ref ExtVal self) => true;
+    public static bool DropOnce(ref Rt rt, ref ExtVal self) => true;
 
     public ExtTy NewImmTy(string name)
     {
@@ -141,8 +145,8 @@ public ref struct Rt
             || (a.Kind is PortKind.Eraser or PortKind.ExtVal && b.Kind is PortKind.Eraser or PortKind.ExtVal))
         {
             // Erase
-            a.Drop();
-            b.Drop();
+            a.Drop(ref this);
+            b.Drop(ref this);
         }
         else
         {
@@ -166,7 +170,7 @@ public ref struct Rt
             // Debug.Assert(InFastPhase);
             // Copy
             LinkWire(b.Aux.Left, a);
-            LinkWire(b.Aux.Right, a.Dup());
+            LinkWire(b.Aux.Right, a.Dup(ref this));
         } else if (a.Kind == PortKind.Global)
         {
             // Expand
@@ -251,9 +255,9 @@ public ref struct Rt
         Debug.Assert(id < ExtFns.Count);
 
         if (swp)
-            return ExtFns[id](b, a);
+            return ExtFns[id](ref this, b, a);
 
-        return ExtFns[id](a, b);
+        return ExtFns[id](ref this ,a, b);
     }
 
     void LinkRegister(int reg, Port p)
