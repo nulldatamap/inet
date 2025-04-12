@@ -115,6 +115,8 @@ public ref struct Heap
                 var flip = f ? "^" : "";
                 if (lbl < names.Length)
                     label = names[lbl];
+                if (p.Kind == PortKind.Operator)
+                    label = "";
                 return $"{s}{flip}{label}({Pretty(p.Aux.Left.ToPort(), seen)} {Pretty(p.Aux.Right.ToPort(), seen)})";
             case PortKind.Wire:
                 if (seen.Add(p.Wire))

@@ -164,8 +164,7 @@ class Application
 
         rt.Globals.AddRange(Compiler.Compile(new Module([
             new Def("main", Expr.Lam(["io"],
-                    Expr.Let("xs", Expr.ExtCall(4, Expr.I32(3), Expr.I32(9)),
-                        Expr.Print(Expr.Var("io"), Expr.ExtCall(5, Expr.Var("xs"), Expr.I32(0)))))),
+                        Expr.Print(Expr.Var("io"), Expr.Lower(Expr.Lift(Expr.Tup( Expr.Add(Expr.I32(0), Expr.I32(1)), Expr.I32(0))))))),
             new Def("id", Expr.Lam(["x"], Expr.Var("x"))),
             new Def("pair", Expr.Lam(["x"], Expr.Tup(Expr.Var("x"), Expr.Var("x")))),
         ])));
@@ -220,7 +219,7 @@ class Application
         rt.Interact(Port.Global(0), Port.FromExtVal(ExtVal.MakeRef(Rt.IOTy, 0UL)));
         Console.WriteLine(rt.ToString());
 
-        var v = new TUIVisualizer();
+        var v = new TextVisualizer();
         v.Visualize(rt, log);
         Console.ReadKey();
 

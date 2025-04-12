@@ -113,7 +113,7 @@ public struct Cell<T> : IRefCounted where T : unmanaged
     public void Increment(ref Rt rt)
     {
         var v = Interlocked.Increment(ref _count);
-        Debug.Assert(v >= 1);
+        Debug.Assert(v > 1);
     }
 
     public bool Decrement(ref Rt rt)
@@ -303,6 +303,7 @@ public readonly struct ExtVal
     public static unsafe ExtVal MakeUniq<T>(ExtTy ty, T v, nuint extraPayloadSize = 0) where T: unmanaged
     {
         var ptr = (T*)NativeMemory.AlignedAlloc((nuint)Unsafe.SizeOf<T>() + extraPayloadSize, 16);
+        *ptr = v;
         Debug.Assert(ty.Flags == ExtTyFlags.Uniq);
         return new ExtVal(ty, (ulong)ptr);
     }

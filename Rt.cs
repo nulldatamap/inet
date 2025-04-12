@@ -50,7 +50,7 @@ public ref struct Rt
     readonly List<ExtTyDesc> _immTypeDescs = [ExtTyDesc.Imm("i32")];
     readonly List<ExtTyDesc> _refTypeDescs = [ExtTyDesc.Ref<ulong>("io")];
     readonly List<ExtTyDesc> _uniqTypeDescs = [
-        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<ulong>(), false, DisallowDup, DisallowDrop),
+        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<Port>(), false, DisallowDup, DisallowDrop),
         new ExtTyDesc("array", Immediate: false, (uint)Unsafe.SizeOf<Slots>(), true, Slots.Increment, Slots.Decrement, Slots.GetSize)
     ];
 
@@ -169,18 +169,43 @@ public ref struct Rt
         {
             // Debug.Assert(InFastPhase);
             // Copy
-            LinkWire(b.Aux.Left, a);
-            LinkWire(b.Aux.Right, a.Dup(ref this));
+            LinkWire(b.Aux.Left, a.Dup(ref this));
+            LinkWire(b.Aux.Right, a);
         } else if (a.Kind == PortKind.Global)
         {
             // Expand
             // Debug.Assert(!InFastPhase);
             Debug.Assert(a.GlobalIndex < (ulong)Globals.Count);
             Execute(Globals[(int)a.GlobalIndex], b);
-        } else if (a.Kind == b.Kind
-                   && a.IsBinary
-                   && a.Label == b.Label)
+        } else if (a.Kind == PortKind.Operator
+                  && a.Operator == OperatorKind.Branch
+                  && b.Kind == PortKind.ExtVal)
         {
+            // Branch
+            Debug.Assert(!InFastPhase);
+            var newBr = Heap.AllocNode(PortKind.Operator, (ushort)OperatorKind.Branch);
+            LinkWire(a.Aux.Left, newBr);
+            var (thenW, elseW) =
+                b.ExtVal.IsTruthy ?
+                    (newBr.Aux.Left, newBr.Aux.Right) :
+                    (newBr.Aux.Right, newBr.Aux.Left);
+            LinkWire(elseW, Port.Eraser());
+            LinkWire(thenW, a.Aux.Right.ToPort());
+        // NOTE: Unlike other operators `lift` doesn't commute nor annihilate
+        // hence why it's before the binary port checks.
+        // We want it not to commute in order to lift binary ports like:
+        //      tup(x0 x1) = ^(0 t)   =>   t = <EXT-PORT tup(x0 x1)>
+        }  else if (a.Kind == PortKind.Operator
+                    && a.Operator == OperatorKind.Lift)
+        {  
+             // Lift
+             LinkWire(a.Aux.Left, Port.Eraser());
+             var liftedPort = ExtVal.MakeUniq(Rt.PortTy, b);
+             LinkWire(a.Aux.Right, Port.FromExtVal(liftedPort));
+        }  else if (a.Kind == b.Kind
+                    && a.IsBinary
+                    && a.Label == b.Label)
+        {  
             // Annihilate
             Debug.Assert(InFastPhase);
             LinkWire(a.Aux.Left, b.Aux.Left.ToPort());
@@ -189,10 +214,10 @@ public ref struct Rt
         {
             Debug.Assert(!InFastPhase);
             // Commute
-            var al = Heap.AllocNode(PortKind.Comb, a.Label);
-            var ar = Heap.AllocNode(PortKind.Comb, a.Label);
-            var bl = Heap.AllocNode(PortKind.Comb, b.Label);
-            var br = Heap.AllocNode(PortKind.Comb, b.Label);
+            var al = Heap.AllocNode(a.Kind, a.Label);
+            var ar = Heap.AllocNode(a.Kind, a.Label);
+            var bl = Heap.AllocNode(b.Kind, b.Label);
+            var br = Heap.AllocNode(b.Kind, b.Label);
 
             LinkWire(al.Aux.Left, bl.Aux.Left.ToPort());
             LinkWire(al.Aux.Right, br.Aux.Left.ToPort());
@@ -223,22 +248,21 @@ public ref struct Rt
             LinkWire(a.Aux.Left, newFn);
             LinkWire(newFn.Aux.Left, b);
             LinkWire(newFn.Aux.Right, a.Aux.Right.ToPort());
-        }
-        else if (a.Kind == PortKind.Operator
-                 && b.Kind == PortKind.ExtVal
-                 && a.Operator == OperatorKind.Branch)
+        } else if (a.Kind == PortKind.Operator
+                           && a.Operator == OperatorKind.Lower 
+                           && b.Kind == PortKind.ExtVal)
         {
-            // Branch
-            Debug.Assert(!InFastPhase);
-            var newBr = Heap.AllocNode(PortKind.Operator, (ushort)OperatorKind.Branch);
-            LinkWire(a.Aux.Left, newBr);
-            var (thenW, elseW) =
-                b.ExtVal.IsTruthy ?
-                    (newBr.Aux.Left, newBr.Aux.Right) :
-                    (newBr.Aux.Right, newBr.Aux.Left);
-            LinkWire(elseW, Port.Eraser());
-            LinkWire(thenW, a.Aux.Right.ToPort());
-        }
+            // Lower
+            LinkWire(a.Aux.Left, Port.Eraser());
+            var v = b.ExtVal;
+            Debug.Assert(v.Type == PortTy);
+            Port loweredPort;
+            unsafe
+            {
+                loweredPort = *(Port*)v.GetPointer();
+            }
+            LinkWire(a.Aux.Right, loweredPort);
+        } 
         else if (sym)
         {
             Interact(b, a, sym: false);

@@ -18,6 +18,8 @@ public abstract class Expr
     public static UntupExpr Untup(string[] xs, Expr t, Expr b) => new (xs, t, b);
     public static PrintExpr Print(Expr io, Expr val) => new(io, val);
     public static ExtCallExpr ExtCall(ushort id, Expr a, Expr b) => new(id, a, b);
+    public static LiftExpr Lift(Expr e) => new(e);
+    public static LowerExpr Lower(Expr e) => new(e);
     // public static InlineExpr Inline(Func<Reg[], Inst[]> insts, params Expr[] es) => new bool(insts, es);
 }
 
@@ -94,6 +96,16 @@ public sealed class ExtCallExpr(ushort id, Expr a, Expr b) : Expr
     public readonly ushort ExtFnId = id;
     public readonly Expr Left = a;
     public readonly Expr Right = b;
+}
+
+public sealed class LiftExpr(Expr a) : Expr
+{
+    public readonly Expr Inner = a;
+}
+
+public sealed class LowerExpr(Expr a) : Expr
+{
+    public readonly Expr Inner = a;
 }
 
 public class Def(string name, Expr body)
@@ -264,6 +276,22 @@ public class Compiler
     void Tup(Reg l, Reg r, Reg res)
     {
         _instructions.Add(new BinaryInst(PortKind.Comb, Constr, l, r, res));
+    }
+    
+    void Lift(Reg v, Reg res)
+    {
+        // v = ^(0 res)
+        var r = Gen();
+        Val(r, ExtVal.Nil);
+        _instructions.Add(new BinaryInst(PortKind.Operator, (ushort)OperatorKind.Lift, v, r, res));
+    }
+    
+    void Lower(Reg v, Reg res)
+    {
+        // v = ,(0 res)
+        var r = Gen();
+        Val(r, ExtVal.Nil);
+        _instructions.Add(new BinaryInst(PortKind.Operator, (ushort)OperatorKind.Lower, v, r, res));
     }
 
     void RightChain<L, T>(Reg head, L xs, Func<T, Reg> f, Action<Reg, Reg, Reg> g, Func<Reg>? final = null) where L: IList<T>
@@ -483,6 +511,18 @@ public class Compiler
                 Compile(extCall.Left),
                 Compile(extCall.Right),
                 res);
+            return;
+        }
+
+        if (e is LiftExpr lift)
+        {
+            Lift(Compile(lift.Inner), res);
+            return;
+        }
+        
+        if (e is LowerExpr lower)
+        {
+            Lower(Compile(lower.Inner), res);
             return;
         }
 
