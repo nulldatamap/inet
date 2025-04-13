@@ -81,7 +81,37 @@ interface IRefCounted
     public bool Decrement(ref Rt rt);
 }
 
-public struct Cell<T> : IRefCounted where T : unmanaged
+interface IBox<TSelf> where TSelf: IBox<TSelf>, allows ref struct
+{
+    public static unsafe ref TSelf UnsafeGetFromExtVal(ExtVal v) => ref Unsafe.AsRef<TSelf>(v.GetPointer());
+}
+
+interface IArrayLike<TSelf, T>: IBox<TSelf> where TSelf: IBox<TSelf>, IArrayLike<TSelf, T>, allows ref struct
+{
+    protected uint InternalLength { get; set; }
+    
+    public static unsafe ref Slots Alloc(uint length)
+    {
+        var ptr = (Slots*)NativeMemory.AlignedAlloc((nuint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * length), 16);
+        ptr->InternalLength = length;
+        return ref Unsafe.AsRef<Slots>(ptr);
+    }
+    
+    public static unsafe ExtVal* GetPayloadPointer(ref TSelf self) => (ExtVal*)&((Slots*)Unsafe.AsPointer(ref self))[1];
+    public static unsafe Span<T> AsSpan(ref TSelf self) => new Span<T>(GetPayloadPointer(ref self), (int)self.InternalLength);
+
+}
+
+interface IVTable<TSelf> : IRefCounted, IBox<TSelf> where TSelf : unmanaged, IVTable<TSelf>, allows ref struct
+{
+    public static void Increment(ref Rt rt, ref ExtVal self) => UnsafeGetFromExtVal(self).Increment(ref rt);
+    public static bool Decrement(ref Rt rt, ref ExtVal self) => UnsafeGetFromExtVal(self).Decrement(ref rt);
+
+    public static VTable VTable => new VTable { Dup = Increment, Drop = Decrement };
+    
+}
+
+public ref struct Cell<T> : IRefCounted, IBox<Cell<T>> where T : unmanaged
 {
     private long _count;
     private T _value;
@@ -123,11 +153,11 @@ public struct Cell<T> : IRefCounted where T : unmanaged
     }
 }
 
-public struct Slots : IRefCounted
+public ref struct Slots : IVTable<Slots>, IArrayLike<Slots, ExtVal>
 {
     private uint _count;
     private uint _length;
-    
+
     public uint Length => _length;
 
     internal Slots(uint length)
@@ -136,50 +166,28 @@ public struct Slots : IRefCounted
         _length = length;
     }
 
+    public Span<ExtVal> AsSpan()
+    {
+        unsafe
+        {
+            return IArrayLike<Slots, ExtVal>.AsSpan(ref Unsafe.AsRef<Slots>(&((ulong*)Unsafe.AsPointer(ref _count))[1]));
+        }
+    }
+
+    public uint InternalLength
+    {
+        get => _length; 
+        set => _length = value;
+    }
+
     public static unsafe ref Slots Alloc(uint length)
     {
-        var ptr = (Slots*)NativeMemory.AlignedAlloc((nuint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * length), 16);
-        ptr->_count = 1;
-        ptr->_length = length;
-        return ref Unsafe.AsRef<Slots>(ptr);
+        ref var array = ref IArrayLike<Slots, ExtVal>.Alloc(length);
+        array._count = 1;
+        return ref array;
     }
-
-    public unsafe ExtVal* AsPointer() => (ExtVal*)&((Slots*)Unsafe.AsPointer(ref this))[1];
-    public unsafe Span<ExtVal> AsSpan() => new Span<ExtVal>(AsPointer(), (int)_length);
 
     public long RefCount => _count;
-
-    public static void Increment(ref Rt rt, ref ExtVal self)
-    {
-        unsafe
-        {
-            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
-            slots.Increment(ref rt);
-        }
-    }
-
-    public static bool Decrement(ref Rt rt, ref ExtVal self)
-    {
-        unsafe
-        {
-            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
-            return slots.Decrement(ref rt);
-        }
-    }
-
-    public static uint GetSize(ref Rt rt, ref ExtVal self)
-    {
-        unsafe
-        {
-            ref var slots = ref Unsafe.AsRef<Slots>(self.GetPointer());
-            return slots.GetSize(ref rt);
-        }
-    }
-
-    public uint GetSize(ref Rt rt)
-    {
-        return (uint)(Unsafe.SizeOf<Slots>() + Unsafe.SizeOf<ExtVal>() * _length);
-    }
 
     public void Increment(ref Rt rt)
     {
@@ -193,7 +201,7 @@ public struct Slots : IRefCounted
         var shouldFree = v == 0;
         if (shouldFree)
         {
-            var span = AsSpan();
+            var span = IArrayLike<Slots, ExtVal>.AsSpan(ref this);
             for (int i = 0; i < span.Length; i++)
             {
                 span[i].Drop(ref rt);
@@ -201,6 +209,17 @@ public struct Slots : IRefCounted
         }
 
         return shouldFree;
+    }
+
+}
+
+public struct Args 
+{
+    private uint _count;
+    private uint _index;
+
+    public void Push()
+    {
     }
 }
 
@@ -216,20 +235,23 @@ public enum ExtTyFlags
     Uniq = DupDropOverload,
 }
 
+public struct VTable
+{
+    public delegate void DupF(ref Rt rt, ref ExtVal self);
+
+    public delegate bool DropF(ref Rt rt, ref ExtVal self);
+
+    public DupF Dup;
+    public DropF Drop;
+}
+
 public readonly record struct ExtTyDesc(
     string Name,
     bool Immediate,
     uint Size = 0,
     bool Dynamic = false,
-    ExtTyDesc.DupF? Dup = null,
-    ExtTyDesc.DropF? Drop = null,
-    ExtTyDesc.GetSizeF? GetSize = null)
+    VTable VTable = default)
 {
-    public delegate void DupF(ref Rt rt, ref ExtVal self);
-
-    public delegate bool DropF(ref Rt rt, ref ExtVal self);
-    public delegate uint GetSizeF(ref Rt rt, ref ExtVal self);
-
     public static ExtTyDesc Imm(string name)
         => new ExtTyDesc(name, Immediate: true);
 
@@ -359,7 +381,7 @@ public readonly struct ExtVal
         {
             var self = this;
             var desc = rt.GetTypeDesc(Type);
-            desc.Dup(ref rt, ref self);
+            desc.VTable.Dup(ref rt, ref self);
             return self;
         }
 
@@ -376,7 +398,7 @@ public readonly struct ExtVal
             {
                 var self = this;
                 var desc = rt.GetTypeDesc(Type);
-                if (desc.Drop(ref rt, ref self))
+                if (desc.VTable.Drop(ref rt, ref self))
                     NativeMemory.AlignedFree(GetPointer());
                 return;
             }

@@ -34,6 +34,7 @@ public ref struct Rt
     public static readonly ExtTy IOTy = new ExtTy(ExtTyFlags.Ref, 0);
     public static readonly ExtTy PortTy = new ExtTy(ExtTyFlags.Uniq, 0);
     public static readonly ExtTy ArrayTy = new ExtTy(ExtTyFlags.Uniq, 1);
+    public static readonly ExtTy ArgsTy = new ExtTy(ExtTyFlags.Uniq, 2);
     
     public delegate ExtVal ExtFnF(ref Rt rt, ExtVal a, ExtVal b);
 
@@ -50,8 +51,9 @@ public ref struct Rt
     readonly List<ExtTyDesc> _immTypeDescs = [ExtTyDesc.Imm("i32")];
     readonly List<ExtTyDesc> _refTypeDescs = [ExtTyDesc.Ref<ulong>("io")];
     readonly List<ExtTyDesc> _uniqTypeDescs = [
-        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<Port>(), false, DisallowDup, DisallowDrop),
-        new ExtTyDesc("array", Immediate: false, (uint)Unsafe.SizeOf<Slots>(), true, Slots.Increment, Slots.Decrement, Slots.GetSize)
+        new ExtTyDesc("port", Immediate: false, (uint)Unsafe.SizeOf<Port>(), false, StrictLinearTypeVTable),
+        new ExtTyDesc("array", Immediate: false, (uint)Unsafe.SizeOf<Slots>(), true, IVTable<Slots>.VTable),
+        new ExtTyDesc("args", Immediate: false, (uint)Unsafe.SizeOf<Args>(), true, StrictLinearTypeVTable)
     ];
 
     public static void DisallowDup(ref Rt rt, ref ExtVal self)
@@ -61,6 +63,9 @@ public ref struct Rt
         => throw new InvalidOperationException($"`{self}` is not a dropable type");
 
     public static bool DropOnce(ref Rt rt, ref ExtVal self) => true;
+
+    public static VTable LooseLinearTypeVTable => new VTable { Dup = DisallowDup, Drop = DropOnce };
+    public static VTable StrictLinearTypeVTable => new VTable { Dup = DisallowDup, Drop = DisallowDrop };
 
     public ExtTy NewImmTy(string name)
     {
@@ -76,10 +81,10 @@ public ref struct Rt
         return new ExtTy(ExtTyFlags.Ref, (ushort)id);
     }
 
-    public ExtTy NewUniqTy<T>(string name, ExtTyDesc.DupF? dup = null, ExtTyDesc.DropF? drop = null) where T : unmanaged
+    public ExtTy NewUniqTy<T>(string name, VTable? vtable = default) where T : unmanaged
     {
         var id = _uniqTypeDescs.Count;
-        _uniqTypeDescs.Add(new ExtTyDesc(name, Immediate: false, (uint)Unsafe.SizeOf<T>(), Dup: dup ?? DisallowDup, Drop: drop ?? DisallowDrop));
+        _uniqTypeDescs.Add(new ExtTyDesc(name, Immediate: false, (uint)Unsafe.SizeOf<T>(), VTable: vtable ?? StrictLinearTypeVTable));
         return new ExtTy(ExtTyFlags.Uniq, (ushort)id);
     }
 
