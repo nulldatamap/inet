@@ -27,4 +27,18 @@ fn main() {
     };
     rt.execute(&prog, Port::from_extval(3));
     println!("{:?}", rt);
+
+    loop {
+        while let Some((a, b)) = rt.active_fast.pop() {
+            rt.interact(a, b);
+            println!("{:?}", rt);
+        }
+
+        if let Some((a, b)) = rt.active_slow.pop() {
+            rt.interact(a, b);
+            println!("{:?}", rt);
+        } else {
+            break;
+        }
+    }
 }

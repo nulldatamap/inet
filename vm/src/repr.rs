@@ -21,20 +21,22 @@ impl<'h> Wire<'h> {
 
     pub fn load(&self) -> Option<Port<'h>> {
         // SAFETY: The loaded value is of lifetime `h` because the Wire is
-        unsafe {
-            Port::option_from_raw(self.0.load())
-        }
+        unsafe { Port::option_from_raw(self.0.load()) }
     }
 
     pub fn swap(&self, p: Option<Port<'h>>) -> Option<Port<'h>> {
         // SAFETY: The loaded value is of lifetime `h` because the Wire is
         unsafe {
-            Port::option_from_raw(self.0.swap(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut())))
+            Port::option_from_raw(
+                self.0
+                    .swap(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut())),
+            )
         }
     }
 
     pub fn store(&self, p: Option<Port<'h>>) {
-        self.0.store(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut()))
+        self.0
+            .store(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut()))
     }
 }
 
@@ -112,7 +114,8 @@ impl Tag {
     }
 }
 
-pub enum Operator {
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum OperatorLabel {
     Branch,
     Lift,
     Lower,
@@ -155,7 +158,13 @@ impl<'h> Port<'h> {
 
     pub fn from_extval(e: i32) -> Port<'static> {
         // SAFETY: The value is not a pointer, hence 'static
-        unsafe { Port::from_parts(Tag::ExtVal, 0, std::ptr::null_mut::<()>().map_addr(|_| (e << TAG_SHIFT) as usize)) }
+        unsafe {
+            Port::from_parts(
+                Tag::ExtVal,
+                0,
+                std::ptr::null_mut::<()>().map_addr(|_| (e << TAG_SHIFT) as usize),
+            )
+        }
     }
 
     pub fn raw(&self) -> NonNull<()> {
@@ -180,8 +189,22 @@ impl<'h> Port<'h> {
         //         value (i.e. a valid ref), so converting it back should be safe
         Wire::from_ref(unsafe { self.addr().cast::<Word>().as_ref().unwrap() })
     }
-}
 
+    pub fn aux(&self) -> (Wire<'h>, Wire<'h>) {
+        debug_assert!(self.tag().is_binary());
+        let aux_ptr: *mut Word = self.addr().cast();
+        // TODO: Use .is_aligned_to once it is stable
+        debug_assert!(aux_ptr.cast::<WordPair>().is_aligned());
+
+        // SAFETY: Binary nodes should always have been created from allocating
+        //         Hence their lifetime is bound to `h`, and they should be
+        //         `WordPair` aligned and pointing to a valid pair, hence why
+        (
+            Wire::from_ref(unsafe { aux_ptr.as_ref().unwrap() }),
+            Wire::from_ref(unsafe { aux_ptr.offset(1).as_ref().unwrap() }),
+        )
+    }
+}
 
 impl<'h> fmt::Debug for Port<'h> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,5 +217,12 @@ impl<'h> fmt::Debug for Port<'h> {
             Tag::Operator => todo!(),
             Tag::Eraser => todo!(),
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<'h> Drop for Port<'h> {
+    fn drop(&mut self) {
+        // TODO: Assert for ref-counted ext-vals that they are truely dropped
     }
 }

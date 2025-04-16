@@ -15,8 +15,8 @@ macro_rules! sym {
 pub struct Rt<'h> {
     pub(crate) allocator: Allocator<'h>,
 
-    active_fast: Vec<(Port<'h>, Port<'h>)>,
-    active_slow: Vec<(Port<'h>, Port<'h>)>,
+    pub(crate) active_fast: Vec<(Port<'h>, Port<'h>)>,
+    pub(crate) active_slow: Vec<(Port<'h>, Port<'h>)>,
 
     registers: Vec<Option<Port<'h>>>,
 }
@@ -51,7 +51,7 @@ impl<'h> Rt<'h> {
                 return Port::from_wire(w)
             }
         }
-        unreachable!()
+        p
     }
 
     fn link_wire(&mut self, w: Wire<'h>, p: Port<'h>) {
@@ -77,8 +77,66 @@ impl<'h> Rt<'h> {
         }
     }
 
+    pub(crate) fn interact(&mut self, a: Port<'h>, b: Port<'h>) {
+        use Tag::*;
 
-    fn interact(&mut self, a: Port<'h>, b: Port<'h>) {
+        match ((a.tag(), a), (b.tag(), b)) {
+            sym!((Wire, _), _) | sym!((Eraser | ExtVal, _)) => unreachable!(),
+            // TODO: sym!(((Global, a), (Comb, b))) if labels bla bla
+            sym!((Global, a), (_, b)) => self.expand(a, b),
+            sym!((Eraser, a), (_, b)) |  sym!((ExtVal, a), (Comb, b)) => self.copy(a, b),
+            ((Comb, a), (Comb, b)) | ((ExtFn, a), (ExtFn, b)) | ((Operator, a), (Operator, b)) if a.label() == b.label() => self.annihilate(a, b),
+            ((Comb | ExtFn | Operator, a), (Comb | ExtFn | Operator, b)) => self.commute(a, b),
+            sym!((Operator, a), (ExtVal, b)) if a.label() == OperatorLabel::Branch as u16 => self.branch(a, b),
+            sym!((ExtFn, a), (ExtVal, b)) => self.call(a, b),
+            sym!((Operator, a), (_, b)) => panic!("Unimplemented operator interaction {:?} <> {:?}", a, b),
+        }
+    }
+
+    fn copy(&mut self, a: Port<'h>, b: Port<'h>) {
+        let (l, r) = b.aux();
+        let a0 = self.dup(&a);
+        self.link_wire(l, a0);
+        self.link_wire(r, a);
+    }
+
+    fn annihilate(&mut self, a: Port<'h>, b: Port<'h>) {
+        let (al, ar) = a.aux();
+        let (bl, br) = b.aux();
+        self.link_wire(al, Port::from_wire(bl));
+        self.link_wire(ar, Port::from_wire(br));
+    }
+
+    fn commute(&mut self, a: Port<'h>, b: Port<'h>) {
+        let (a0, a0l, a0r) = self.allocator.alloc_node(a.tag(), a.label());
+        let (a1, a1l, a1r) = self.allocator.alloc_node(a.tag(), a.label());
+        let (b0, b0l, b0r) = self.allocator.alloc_node(b.tag(), b.label());
+        let (b1, b1l, b1r) = self.allocator.alloc_node(b.tag(), b.label());
+
+        self.link_wire(a0l, Port::from_wire(b0l));
+        self.link_wire(a0r, Port::from_wire(b1l));
+        self.link_wire(a1l, Port::from_wire(b0r));
+        self.link_wire(a1r, Port::from_wire(b1r));
+
+        let (al, ar) = a.aux();
+        let (bl, br) = b.aux();
+
+        self.link_wire(al, b0);
+        self.link_wire(ar, b1);
+        self.link_wire(bl, a0);
+        self.link_wire(br, a1);
+    }
+
+    fn expand(&mut self, g: Port<'h>, p: Port<'h>) {
+        todo!()
+    }
+
+    fn branch(&mut self, a: Port<'h>, b: Port<'h>) {
+        todo!()
+    }
+
+    fn call(&mut self, f: Port<'h>, x: Port<'h>) {
+        todo!()
     }
 
     fn link_register(&mut self, r : Reg, p: Port<'h>) {
