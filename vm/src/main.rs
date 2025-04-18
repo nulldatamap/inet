@@ -16,10 +16,15 @@ use rt::*;
 
 fn main() {
     let h = Heap::new(NonZeroUsize::new(4096).unwrap());
-    let mut rt = Rt::new(&h, builtins());
+    let mut rt = Rt::new(&h, Externals::builtins());
     let uprog = Compiler::compile(vec![
-        def("main", print(print(i(0), i(1)), i(4)/*letv("x", v("c"), letv("y", v("x"), v("x")))*/)),
-        def("c", print(i(3), i(99))),
+        def("main",
+            letv("io", i(1),
+                 print(v("io"), seq(vec![
+                     i(0),
+                     i(99)
+                 ]))
+            )),
     ])
     .unwrap();
     println!("{:?}", uprog);

@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    ext::Externals,
     program::*,
     repr::{CombLabel, ExtFnLabel, Tag},
     Port,
@@ -38,7 +39,10 @@ pub fn letv(x: &'static str, v: Expr, b: Expr) -> Expr {
     Expr::Let(x.to_string(), Box::new(v), Box::new(b))
 }
 pub fn print(a: Expr, b: Expr) -> Expr {
-    Expr::ExtCall(0, Box::new(a), Box::new(b))
+    Expr::ExtCall(Externals::PRINT, Box::new(a), Box::new(b))
+}
+pub fn seq(es: Vec<Expr>) -> Expr {
+    Expr::Do(es)
 }
 
 pub fn def(x: &'static str, e: Expr) -> Def {
@@ -194,6 +198,10 @@ impl Compiler {
         }
     }
 
+    fn extcall(&mut self, lbl: u16, x: Reg, y: Reg, r: Reg) {
+        self.insts.push(UInst::Binary(Tag::ExtFn, lbl, x, y, r))
+    }
+
     pub fn compile(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
         let mut c = Compiler::new();
 
@@ -225,13 +233,15 @@ impl Compiler {
     }
 
     fn materialize_users(&mut self, mut users: Vec<Reg>) -> Result<Reg> {
+        // Reverse the user order so we preserve effect orders
+        users.reverse();
         if let Some(last) = users.pop() {
             if users.is_empty() {
                 // If there's exactly one user, just wire it up directly:
                 Ok(last)
             } else {
                 // Produce:
-                //   x = dup(u0 dup(u1 dup(u2 u3)))
+                //   x = dup(u3 dup(u2 dup(u1 u0)))
                 Ok(users.into_iter().rfold(last, |rhs, u| {
                     let r = self.gen();
                     self.dup(r, u, rhs);
@@ -273,17 +283,36 @@ impl Compiler {
             ExtCall(extfn, e0, e1) => {
                 let a = self.gen_expr(*e0)?;
                 let b = self.gen_expr(*e1)?;
-                self.insts.push(UInst::Binary(
-                    Tag::ExtFn,
-                    ExtFnLabel::new(false, extfn.try_into().unwrap()).into(),
-                    a,
-                    b,
-                    r,
-                ));
+                self.extcall(extfn, a, b, r);
             }
-            Add(expr, expr1) => todo!(),
+            Add(e0, e1) => {
+                let a = self.gen_expr(*e0)?;
+                let b = self.gen_expr(*e1)?;
+                self.extcall(Externals::ADD, a, b, r);
+            }
+            Do(mut es) => {
+                if let Some(e_last) = es.pop() {
+                    if es.is_empty() {
+                        // Single expression? Just compile that directly
+                        self.expr(e_last, r)?;
+                    } else {
+                        // Generate:
+                        //   r = SEQ(SEQ(SEQ(e3 e2) e1) e0)
+                        let last = es.into_iter().try_fold(r, |prev_x, e_y| -> Result<Reg> {
+                            // prev_x = SEQ(x y)
+                            let x = self.gen();
+                            let y = self.gen_expr(e_y)?;
+                            self.extcall(Externals::SEQ, x, y, prev_x);
+                            Ok(x)
+                        })?;
+                        self.expr(e_last, last)?;
+                    }
+                } else {
+                    // Empty seq, return "nil"
+                    self.val(r, 0);
+                }
+            }
             If(expr, expr1, expr2) => todo!(),
-            Do(vec) => todo!(),
             Call(expr, vec) => todo!(),
             Lam(vec, expr) => todo!(),
             Tup(vec) => todo!(),

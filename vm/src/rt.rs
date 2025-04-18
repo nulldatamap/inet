@@ -153,7 +153,7 @@ impl<'h> Rt<'h> {
             if y_val.tag() == Tag::ExtVal {
                 self.allocator.free_wire(y);
                 let (flipped, idx) = f.extfn_label().get();
-                let (a, b) = if flipped { (x, y_val) } else { (y_val, x) };
+                let (a, b) = if flipped { (y_val, x) } else { (x, y_val) };
                 let r = self.externals.extfns[idx](self, a.to_extval(), b.to_extval());
                 self.link_wire(res, Port::from_extval(r));
                 return;
