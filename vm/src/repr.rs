@@ -2,6 +2,8 @@ use core::fmt;
 use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 use std::{marker::PhantomData, ptr::NonNull};
 
+use crate::program::Program;
+
 pub struct Wire<'h>(&'h Word);
 
 impl<'h> Wire<'h> {
@@ -89,7 +91,7 @@ const LABEL_SHIFT: usize = 48;
 const ADDR_MASK: usize = !(TAG_MASK | 0xFFusize << LABEL_SHIFT);
 
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Tag {
     ExtVal = 1,
     ExtFn = 2,
@@ -98,6 +100,20 @@ pub enum Tag {
     Operator = 5,
     Wire = 6,
     Eraser = 7,
+}
+
+impl fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tag::ExtVal => write!(f, "EXTVAL"),
+            Tag::ExtFn => write!(f, "EXTFN"),
+            Tag::Global => write!(f, "G"),
+            Tag::Comb => write!(f, "C"),
+            Tag::Operator => write!(f, "O"),
+            Tag::Wire => write!(f, "W"),
+            Tag::Eraser => write!(f, "_"),
+        }
+    }
 }
 
 impl Tag {
@@ -120,6 +136,126 @@ pub enum OperatorLabel {
     Lift,
     Lower,
 }
+
+impl Into<u16> for OperatorLabel {
+    fn into(self) -> u16 {
+        self as u16
+    }
+}
+
+impl From<u16> for OperatorLabel {
+    fn from(x: u16) -> Self {
+        match x {
+            0 => OperatorLabel::Branch,
+            1 => OperatorLabel::Lift,
+            2 => OperatorLabel::Lower,
+            _ => panic!("Invalid operator label: `{}`", x),
+        }
+    }
+}
+
+impl fmt::Debug for OperatorLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OperatorLabel::Branch => "?",
+            OperatorLabel::Lift => "^",
+            OperatorLabel::Lower => ",",
+        })
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum CombLabel {
+    Fn,
+    Tup,
+    Dup(u16),
+}
+
+impl Into<u16> for CombLabel {
+    fn into(self) -> u16 {
+        match self {
+            CombLabel::Fn => 0,
+            CombLabel::Tup => 1,
+            CombLabel::Dup(v) => {
+                debug_assert!((v as usize + 2) <= u16::MAX as usize);
+                2 + v
+            }
+        }
+    }
+}
+
+impl From<u16> for CombLabel {
+    fn from(x: u16) -> CombLabel {
+        match x {
+            0 => CombLabel::Fn,
+            1 => CombLabel::Tup,
+            _ => CombLabel::Dup(x - 2),
+        }
+    }
+}
+
+impl fmt::Debug for CombLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CombLabel::Fn => write!(f, "fn"),
+            CombLabel::Tup => write!(f, "tup"),
+            CombLabel::Dup(x) => write!(f, "dup{}", x),
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ExtFnLabel(u16);
+
+impl ExtFnLabel {
+    const FLIP_BIT: u16 = 1 << 15;
+
+    fn new(flipped: bool, index: usize) -> Self {
+        assert!(index <= (Self::FLIP_BIT as usize - 1));
+        ExtFnLabel(if flipped {
+            Self::FLIP_BIT | (index as u16)
+        } else {
+            index as u16
+        })
+    }
+
+    fn is_flipped(self) -> bool {
+        (self.0 & Self::FLIP_BIT) != 0
+    }
+    fn flip(self) -> Self {
+        ExtFnLabel(self.0 ^ Self::FLIP_BIT)
+    }
+
+    fn get(self) -> (bool, usize) {
+        (
+            self.0 & Self::FLIP_BIT != 0,
+            (self.0 & Self::FLIP_BIT) as usize,
+        )
+    }
+}
+
+impl From<u16> for ExtFnLabel {
+    fn from(x: u16) -> ExtFnLabel {
+        ExtFnLabel(x)
+    }
+}
+
+impl Into<u16> for ExtFnLabel {
+    fn into(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Debug for ExtFnLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (fl, i) = self.get();
+        if fl { write!(f, "'")?; }
+        write!(f, "{}", i)
+    }
+}
+
+pub type ExtVal = i32;
 
 #[repr(transparent)]
 pub struct Port<'h>(NonNull<()>, PhantomData<&'h ()>);
@@ -147,16 +283,21 @@ impl<'h> Port<'h> {
     }
 
     // SAFETY: `p` must actually be of lifetime `h`
+    pub unsafe fn from_raw(p: NonNull<()>) -> Port<'h> {
+        Port(p, PhantomData)
+    }
+
+    // SAFETY: `p` must actually be of lifetime `h`
     pub unsafe fn option_from_raw(p: *mut ()) -> Option<Port<'h>> {
         if p.addr() & TAG_MASK == 0 {
             None
         } else {
             // SAFETY: Since the tag wasn't zero, the pointer can't be zero
-            Some(Port(NonNull::new_unchecked(p.cast()), PhantomData))
+            Some(Self::from_raw(NonNull::new_unchecked(p)))
         }
     }
 
-    pub fn from_extval(e: i32) -> Port<'static> {
+    pub fn from_extval(e: ExtVal) -> Port<'static> {
         // SAFETY: The value is not a pointer, hence 'static
         unsafe {
             Port::from_parts(
@@ -165,6 +306,22 @@ impl<'h> Port<'h> {
                 std::ptr::null_mut::<()>().map_addr(|_| (e << TAG_SHIFT) as usize),
             )
         }
+    }
+
+    pub fn from_global(g: NonNull<Program<'h>>) -> Port<'h> {
+        // SAFETY: The value is from a 'h ref, so it's all good
+        unsafe {
+            Port::from_parts(
+                Tag::Global,
+                0,
+                g.as_ptr() as *mut ()
+            )
+        }
+    }
+
+    pub fn eraser() -> Port<'static> {
+        // SAFETY: The value is not a pointer, hence 'static
+        unsafe { Port::from_parts(Tag::Eraser, 0, std::ptr::null_mut()) }
     }
 
     pub fn raw(&self) -> NonNull<()> {
@@ -190,6 +347,13 @@ impl<'h> Port<'h> {
         Wire::from_ref(unsafe { self.addr().cast::<Word>().as_ref().unwrap() })
     }
 
+    pub fn to_global(self) -> &'h Program<'h> {
+        debug_assert_eq!(self.tag(), Tag::Global);
+        // SAFETY: Global ports should have been created from a reference to Global
+        //         So it's safe to turn it back into one
+        unsafe { self.addr().cast::<Program<'h>>().as_ref().unwrap() }
+    }
+
     pub fn aux(&self) -> (Wire<'h>, Wire<'h>) {
         debug_assert!(self.tag().is_binary());
         let aux_ptr: *mut Word = self.addr().cast();
@@ -209,14 +373,28 @@ impl<'h> Port<'h> {
 impl<'h> fmt::Debug for Port<'h> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.tag() {
-            Tag::Comb => write!(f, "C:{:04X}:{:08X}", self.label(), self.addr().addr()),
+            Tag::Comb => write!(
+                f,
+                "C:{:?}:{:08X}",
+                CombLabel::from(self.label()),
+                self.addr().addr()
+            ),
             Tag::Wire => write!(f, "W:{:08X}", self.addr().addr()),
-            Tag::ExtVal => write!(f, "E:{:08X}", self.addr().addr() >> TAG_SHIFT),
+            Tag::ExtVal => write!(f, "EXTVAL:{:08X}", self.addr().addr() >> TAG_SHIFT),
+            Tag::Eraser => write!(f, "_"),
+            Tag::Global => write!(f, "G:{:08X}", self.addr().addr()),
             Tag::ExtFn => todo!(),
-            Tag::Global => todo!(),
             Tag::Operator => todo!(),
-            Tag::Eraser => todo!(),
         }
+    }
+}
+
+impl Clone for Port<'static> {
+    fn clone(&self) -> Port<'static> {
+        // SAFETY: Making a copy here is safe because any heap type
+        //         needs its lifetime bounds to a heap, so any 'static
+        //         Port should not contain a pointer and should be safe to blit
+        Port(self.0, PhantomData)
     }
 }
 

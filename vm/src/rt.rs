@@ -1,15 +1,17 @@
 use core::fmt;
 
-use crate::{
-    program::*,
-    repr::*,
-    heap::*,
-};
+use crate::{heap::*, program::*, repr::*};
 
 macro_rules! sym {
-    ($p:pat) => { ($p, $p) };
-    ($a:pat, $b:pat) => {($a, $b) | ($b, $a)};
-    ($p:pat, $a:ident, $b:ident) => { (($p, $a), ($p, $b)) };
+    ($p:pat) => {
+        ($p, $p)
+    };
+    ($a:pat, $b:pat) => {
+        ($a, $b) | ($b, $a)
+    };
+    ($p:pat, $a:ident, $b:ident) => {
+        (($p, $a), ($p, $b))
+    };
 }
 
 pub struct Rt<'h> {
@@ -48,7 +50,7 @@ impl<'h> Rt<'h> {
                 self.allocator.free_wire(w);
                 p = x;
             } else {
-                return Port::from_wire(w)
+                return Port::from_wire(w);
             }
         }
         p
@@ -62,14 +64,13 @@ impl<'h> Rt<'h> {
         }
     }
 
-    fn link(&mut self, a: Port<'h>, b: Port<'h>) {
+    pub fn link(&mut self, a: Port<'h>, b: Port<'h>) {
         match ((a.tag(), a), (b.tag(), b)) {
             sym!((Tag::Wire, a), (_, b)) => self.link_wire(a.to_wire(), b),
-            sym!(Tag::Eraser | Tag::Global, a, b)
-                | sym!(Tag::Eraser | Tag::ExtVal, a, b) => {
-                    self.erase(a);
-                    self.erase(b);
-                },
+            sym!(Tag::Eraser | Tag::Global, a, b) | sym!(Tag::Eraser | Tag::ExtVal, a, b) => {
+                self.erase(a);
+                self.erase(b);
+            }
             ((_, a), (_, b)) => {
                 // TODO: Split into both slow and fast
                 self.active_fast.push((a, b));
@@ -84,12 +85,20 @@ impl<'h> Rt<'h> {
             sym!((Wire, _), _) | sym!((Eraser | ExtVal, _)) => unreachable!(),
             // TODO: sym!(((Global, a), (Comb, b))) if labels bla bla
             sym!((Global, a), (_, b)) => self.expand(a, b),
-            sym!((Eraser, a), (_, b)) |  sym!((ExtVal, a), (Comb, b)) => self.copy(a, b),
-            ((Comb, a), (Comb, b)) | ((ExtFn, a), (ExtFn, b)) | ((Operator, a), (Operator, b)) if a.label() == b.label() => self.annihilate(a, b),
+            sym!((Eraser, a), (_, b)) | sym!((ExtVal, a), (Comb, b)) => self.copy(a, b),
+            ((Comb, a), (Comb, b)) | ((ExtFn, a), (ExtFn, b)) | ((Operator, a), (Operator, b))
+                if a.label() == b.label() =>
+            {
+                self.annihilate(a, b)
+            }
             ((Comb | ExtFn | Operator, a), (Comb | ExtFn | Operator, b)) => self.commute(a, b),
-            sym!((Operator, a), (ExtVal, b)) if a.label() == OperatorLabel::Branch as u16 => self.branch(a, b),
+            sym!((Operator, a), (ExtVal, b)) if a.label() == OperatorLabel::Branch as u16 => {
+                self.branch(a, b)
+            }
             sym!((ExtFn, a), (ExtVal, b)) => self.call(a, b),
-            sym!((Operator, a), (_, b)) => panic!("Unimplemented operator interaction {:?} <> {:?}", a, b),
+            sym!((Operator, a), (_, b)) => {
+                panic!("Unimplemented operator interaction {:?} <> {:?}", a, b)
+            }
         }
     }
 
@@ -128,7 +137,8 @@ impl<'h> Rt<'h> {
     }
 
     fn expand(&mut self, g: Port<'h>, p: Port<'h>) {
-        todo!()
+        let prog = g.to_global();
+        self.execute(prog, p);
     }
 
     fn branch(&mut self, a: Port<'h>, b: Port<'h>) {
@@ -139,7 +149,7 @@ impl<'h> Rt<'h> {
         todo!()
     }
 
-    fn link_register(&mut self, r : Reg, p: Port<'h>) {
+    fn link_register(&mut self, r: Reg, p: Port<'h>) {
         if let Some(v) = self.registers[r.index()].take() {
             self.link(p, v);
         } else {
@@ -147,7 +157,7 @@ impl<'h> Rt<'h> {
         }
     }
 
-    pub fn execute(&mut self, prog: &Program, p: Port<'h>) {
+    pub fn execute(&mut self, prog: &'h Program<'h>, p: Port<'h>) {
         self.registers.resize_with(prog.reg_count, || None);
 
         self.link_register(Reg::ROOT, p);
@@ -157,7 +167,7 @@ impl<'h> Rt<'h> {
                 &Inst::Nilary(r, ref v) => {
                     let v = self.dup(v);
                     self.link_register(r, v);
-                },
+                }
                 &Inst::Binary(tag, lbl, a, l, r) => {
                     let (p, lw, rw) = self.allocator.alloc_node(tag, lbl);
                     self.link_register(a, p);
@@ -171,15 +181,13 @@ impl<'h> Rt<'h> {
     }
 }
 
-
 impl<'h> fmt::Debug for Rt<'h> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for w in self.allocator.active_area().iter() {
             let v = unsafe { Port::option_from_raw(w.load()) };
             write!(f, "{:08X}: ", w as *const Word as usize)?;
             if let Some(p) = v {
-            write!(f, "{:?}\n", p)?;
-
+                write!(f, "{:?}\n", p)?;
             } else {
                 write!(f, "-\n")?;
             }

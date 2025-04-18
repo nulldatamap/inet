@@ -1,0 +1,284 @@
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    num::NonZeroUsize,
+};
+
+use crate::{
+    program::*,
+    repr::{CombLabel, Tag},
+    Port,
+};
+
+type UInst = UnlinkedInst;
+
+#[derive(Debug)]
+pub enum Expr {
+    I32(i32),
+    Var(String),
+    Add(Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Let(String, Box<Expr>, Box<Expr>),
+    Do(Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
+    Lam(Vec<String>, Box<Expr>),
+    Tup(Vec<Expr>),
+    Untup(Vec<String>, Box<Expr>, Box<Expr>),
+    ExtCall(u16, Box<Expr>, Box<Expr>),
+    Lift(Box<Expr>),
+    Lower(Box<Expr>),
+}
+
+pub fn i(i: i32) -> Expr {
+    Expr::I32(i)
+}
+pub fn v(x: &'static str) -> Expr {
+    Expr::Var(x.to_string())
+}
+pub fn letv(x: &'static str, v: Expr, b: Expr) -> Expr {
+    Expr::Let(x.to_string(), Box::new(v), Box::new(b))
+}
+
+pub fn def(x: &'static str, e: Expr) -> Def {
+    Def {
+        name: x.to_string(),
+        body: e,
+    }
+}
+
+#[derive(Debug)]
+pub struct Def {
+    name: String,
+    body: Expr,
+}
+
+struct Slot {
+    prev: Option<Box<Slot>>,
+    name: String,
+    users: Vec<Reg>,
+}
+
+impl Slot {
+    fn new(name: String) -> Slot {
+        Slot {
+            prev: None,
+            name,
+            users: Vec::new(),
+        }
+    }
+}
+
+struct Scope {
+    layers: Vec<HashMap<String, Slot>>,
+}
+
+impl Scope {
+    fn new() -> Scope {
+        Scope { layers: vec![] }
+    }
+
+    fn enter(&mut self) {
+        self.layers.push(HashMap::new())
+    }
+
+    fn leave(&mut self) {
+        self.layers.pop().unwrap();
+    }
+
+    fn define(&mut self, n: &str) {
+        let slot = Slot::new(n.to_string());
+        match self
+            .layers
+            .last_mut()
+            .expect("zero scope layers")
+            .entry(n.to_string())
+        {
+            Entry::Occupied(mut e) => {
+                let old_slot = e.insert(slot);
+                let _ = e.get_mut().prev.insert(Box::new(old_slot));
+            }
+            Entry::Vacant(e) => {
+                e.insert(slot);
+            }
+        }
+    }
+
+    fn undefine(&mut self, n: &str) -> Vec<Reg> {
+        if let Entry::Occupied(mut e) = self
+            .layers
+            .last_mut()
+            .expect("zero scope layers")
+            .entry(n.to_string())
+        {
+            if let Some(prev_slot) = e.get_mut().prev.take() {
+                e.insert(*prev_slot).users
+            } else {
+                e.remove().users
+            }
+        } else {
+            panic!("can't undefine non-exisitng variable `{}`", n);
+        }
+    }
+
+    fn lookup(&mut self, n: &str) -> Option<&mut Slot> {
+        for layer in self.layers.iter_mut().rev() {
+            if let Some(slot) = layer.get_mut(n) {
+                return Some(slot);
+            }
+        }
+
+        None
+    }
+}
+
+pub struct Compiler {
+    next_reg: NonZeroUsize,
+    dup_count: u16,
+    globals: HashSet<String>,
+    globals_refs: Vec<String>,
+    insts: Vec<UnlinkedInst>,
+    scope: Scope,
+}
+
+type CompilerError = String;
+type Result<T> = std::result::Result<T, CompilerError>;
+
+impl Compiler {
+    fn new() -> Compiler {
+        Compiler {
+            next_reg: NonZeroUsize::new(1).unwrap(),
+            globals: HashSet::new(),
+            dup_count: 0,
+            globals_refs: Vec::new(),
+            insts: Vec::new(),
+            scope: Scope::new(),
+        }
+    }
+
+    fn gen(&mut self) -> Reg {
+        let r = Reg::new(self.next_reg);
+        self.next_reg = self.next_reg.checked_add(1).expect("Register overflow");
+        r
+    }
+
+    fn val(&mut self, r: Reg, x: i32) {
+        self.insts.push(UInst::Nilary(r, Port::from_extval(x)));
+    }
+
+    fn erase(&mut self, r: Reg) {
+        self.insts.push(UInst::Nilary(r, Port::eraser()));
+    }
+
+    fn dup(&mut self, x: Reg, x0: Reg, x1: Reg) {
+        self.insts.push(UInst::Binary(
+            Tag::Comb,
+            CombLabel::Dup(self.dup_count).into(),
+            x,
+            x0,
+            x1,
+        ));
+        self.dup_count = self
+            .dup_count
+            .checked_add(1)
+            .expect("Too many duplicate nodes!");
+    }
+
+    fn global(&mut self, r: Reg, g: &str) {
+        if let Some(g) = self.globals_refs.iter().position(|x| x == g) {
+            self.insts.push(UInst::Global(r, g));
+        } else {
+            self.insts.push(UInst::Global(r, self.globals_refs.len()));
+            self.globals_refs.push(g.to_string());
+        }
+    }
+
+    pub fn compile(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
+        let mut c = Compiler::new();
+
+        // Declare all the globals:
+        c.globals.extend(defs.iter().map(|d| d.name.clone()));
+
+        defs.into_iter().map(|d| c.def(d)).collect()
+    }
+
+    fn def(&mut self, def: Def) -> Result<UnlinkedProgram> {
+        self.scope.enter();
+        self.expr(def.body, Reg::ROOT)?;
+        let prog = UnlinkedProgram {
+            name: def.name,
+            globals: self.globals_refs.drain(..).collect(),
+            reg_count: self.next_reg.get(),
+            instructions: std::mem::replace(&mut self.insts, Vec::new()),
+        };
+        self.next_reg = NonZeroUsize::new(1).unwrap();
+        self.scope.leave();
+        debug_assert!(self.scope.layers.is_empty());
+        Ok(prog)
+    }
+
+    fn gen_expr(&mut self, e: Expr) -> Result<Reg> {
+        let r = self.gen();
+        self.expr(e, r)?;
+        Ok(r)
+    }
+
+    fn materialize_users(&mut self, mut users: Vec<Reg>) -> Result<Reg> {
+        if let Some(last) = users.pop() {
+            if users.is_empty() {
+                // If there's exactly one user, just wire it up directly:
+                Ok(last)
+            } else {
+                // Produce:
+                //   x = dup(u0 dup(u1 dup(u2 u3)))
+                Ok(users.into_iter().rfold(last, |rhs, u| {
+                    let r = self.gen();
+                    self.dup(r, u, rhs);
+                    r
+                }))
+            }
+        } else {
+            // If there are no users of a value, we need to erase it
+            let r = self.gen();
+            self.erase(r);
+            Ok(r)
+        }
+    }
+
+    fn expr(&mut self, e: Expr, r: Reg) -> Result<()> {
+        use Expr::*;
+        println!(">> {:?} <- {:?}", r, e);
+
+        match e {
+            I32(x) => self.val(r, x),
+            Var(n) => {
+                if let Some(slot) = self.scope.lookup(&n) {
+                    slot.users.push(r);
+                } else {
+                    if self.globals.contains(&n) {
+                        self.global(r, &n);
+                    } else {
+                        return Err(format!("Undefined variable `{}`", n))
+                    }
+                }
+            }
+            Let(x, v, b) => {
+                self.scope.define(&x);
+                self.expr(*b, r)?;
+                let users = self.scope.undefine(&x);
+                let var_reg = self.materialize_users(users)?;
+                self.expr(*v, var_reg)?;
+            }
+            Add(expr, expr1) => todo!(),
+            If(expr, expr1, expr2) => todo!(),
+            Do(vec) => todo!(),
+            Call(expr, vec) => todo!(),
+            Lam(vec, expr) => todo!(),
+            Tup(vec) => todo!(),
+            Untup(vec, expr, expr1) => todo!(),
+            ExtCall(_, expr, expr1) => todo!(),
+            Lift(expr) => todo!(),
+            Lower(expr) => todo!(),
+        }
+
+        Ok(())
+    }
+}
