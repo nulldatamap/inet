@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::{heap::*, program::*, repr::*};
+use crate::{ext::Externals, heap::*, program::*, repr::*};
 
 macro_rules! sym {
     ($p:pat) => {
@@ -16,6 +16,7 @@ macro_rules! sym {
 
 pub struct Rt<'h> {
     pub(crate) allocator: Allocator<'h>,
+    pub(crate) externals: Externals,
 
     pub(crate) active_fast: Vec<(Port<'h>, Port<'h>)>,
     pub(crate) active_slow: Vec<(Port<'h>, Port<'h>)>,
@@ -24,9 +25,10 @@ pub struct Rt<'h> {
 }
 
 impl<'h> Rt<'h> {
-    pub fn new(heap: &'h Heap) -> Rt<'h> {
+    pub fn new(heap: &'h Heap, exts: Externals) -> Rt<'h> {
         Rt {
             allocator: Allocator::new(heap),
+            externals: exts,
 
             active_fast: Vec::new(),
             active_slow: Vec::new(),
@@ -35,13 +37,13 @@ impl<'h> Rt<'h> {
         }
     }
 
-    fn dup(&mut self, p: &Port<'h>) -> Port<'h> {
+    pub fn dup(&mut self, p: &Port<'h>) -> Port<'h> {
         // TODO: Proper dup'ing
         unsafe { Port::option_from_raw(p.raw().as_ptr()).unwrap() }
     }
 
     // TODO: Proper erasing
-    fn erase(&mut self, p: Port<'h>) {}
+    pub fn erase(&mut self, p: Port<'h>) {}
 
     fn follow_wire(&mut self, mut p: Port<'h>) -> Port<'h> {
         while p.tag() == Tag::Wire {
@@ -146,7 +148,24 @@ impl<'h> Rt<'h> {
     }
 
     fn call(&mut self, f: Port<'h>, x: Port<'h>) {
-        todo!()
+        let (y, res) = f.aux();
+        if let Some(y_val) = y.load() {
+            if y_val.tag() == Tag::ExtVal {
+                self.allocator.free_wire(y);
+                let (flipped, idx) = f.extfn_label().get();
+                let (a, b) = if flipped { (x, y_val) } else { (y_val, x) };
+                let r = self.externals.extfns[idx](self, a.to_extval(), b.to_extval());
+                self.link_wire(res, Port::from_extval(r));
+                return;
+            }
+        }
+
+        let (new_f, yw, resw) = self
+            .allocator
+            .alloc_node(Tag::ExtFn, f.extfn_label().flip().into());
+        self.link_wire(y, new_f);
+        self.link_wire(resw, Port::from_wire(res));
+        self.link_wire(yw, x);
     }
 
     fn link_register(&mut self, r: Reg, p: Port<'h>) {

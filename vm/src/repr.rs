@@ -88,7 +88,7 @@ pub struct WordPair(pub(crate) Word, pub(crate) Word);
 const TAG_MASK: usize = 0b111;
 const TAG_SHIFT: usize = 3;
 const LABEL_SHIFT: usize = 48;
-const ADDR_MASK: usize = !(TAG_MASK | 0xFFusize << LABEL_SHIFT);
+const ADDR_MASK: usize = !(TAG_MASK | 0xFFFFusize << LABEL_SHIFT);
 
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -118,7 +118,7 @@ impl fmt::Debug for Tag {
 
 impl Tag {
     fn is_binary(self) -> bool {
-        matches!(self, Tag::Comb | Tag::Operator)
+        matches!(self, Tag::Comb | Tag::Operator | Tag::ExtFn)
     }
 
     fn is_nilary(self) -> bool {
@@ -211,7 +211,7 @@ pub struct ExtFnLabel(u16);
 impl ExtFnLabel {
     const FLIP_BIT: u16 = 1 << 15;
 
-    fn new(flipped: bool, index: usize) -> Self {
+    pub fn new(flipped: bool, index: usize) -> Self {
         assert!(index <= (Self::FLIP_BIT as usize - 1));
         ExtFnLabel(if flipped {
             Self::FLIP_BIT | (index as u16)
@@ -220,17 +220,18 @@ impl ExtFnLabel {
         })
     }
 
-    fn is_flipped(self) -> bool {
+    pub fn is_flipped(self) -> bool {
         (self.0 & Self::FLIP_BIT) != 0
     }
-    fn flip(self) -> Self {
+
+    pub fn flip(self) -> Self {
         ExtFnLabel(self.0 ^ Self::FLIP_BIT)
     }
 
-    fn get(self) -> (bool, usize) {
+    pub fn get(self) -> (bool, usize) {
         (
             self.0 & Self::FLIP_BIT != 0,
-            (self.0 & Self::FLIP_BIT) as usize,
+            (self.0 & !Self::FLIP_BIT) as usize,
         )
     }
 }
@@ -271,6 +272,11 @@ impl<'h> Port<'h> {
     #[inline(always)]
     pub fn label(&self) -> u16 {
         (self.0.addr().get() >> LABEL_SHIFT) as u16
+    }
+
+    pub fn extfn_label(&self) -> ExtFnLabel {
+        debug_assert_eq!(self.tag(), Tag::ExtFn);
+        self.label().into()
     }
 
     // SAFETY: `value` must actually be of lifetime `h`
@@ -354,6 +360,10 @@ impl<'h> Port<'h> {
         unsafe { self.addr().cast::<Program<'h>>().as_ref().unwrap() }
     }
 
+    pub fn to_extval(self) -> ExtVal {
+        (self.addr().addr() >> TAG_SHIFT).try_into().unwrap()
+    }
+
     pub fn aux(&self) -> (Wire<'h>, Wire<'h>) {
         debug_assert!(self.tag().is_binary());
         let aux_ptr: *mut Word = self.addr().cast();
@@ -383,7 +393,7 @@ impl<'h> fmt::Debug for Port<'h> {
             Tag::ExtVal => write!(f, "EXTVAL:{:08X}", self.addr().addr() >> TAG_SHIFT),
             Tag::Eraser => write!(f, "_"),
             Tag::Global => write!(f, "G:{:08X}", self.addr().addr()),
-            Tag::ExtFn => todo!(),
+            Tag::ExtFn => write!(f, "EXTFN:{:?}:{:08X}", self.extfn_label(), self.addr().addr()),
             Tag::Operator => todo!(),
         }
     }

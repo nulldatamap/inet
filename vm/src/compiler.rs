@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     program::*,
-    repr::{CombLabel, Tag},
+    repr::{CombLabel, ExtFnLabel, Tag},
     Port,
 };
 
@@ -36,6 +36,9 @@ pub fn v(x: &'static str) -> Expr {
 }
 pub fn letv(x: &'static str, v: Expr, b: Expr) -> Expr {
     Expr::Let(x.to_string(), Box::new(v), Box::new(b))
+}
+pub fn print(a: Expr, b: Expr) -> Expr {
+    Expr::ExtCall(0, Box::new(a), Box::new(b))
 }
 
 pub fn def(x: &'static str, e: Expr) -> Def {
@@ -256,7 +259,7 @@ impl Compiler {
                     if self.globals.contains(&n) {
                         self.global(r, &n);
                     } else {
-                        return Err(format!("Undefined variable `{}`", n))
+                        return Err(format!("Undefined variable `{}`", n));
                     }
                 }
             }
@@ -267,6 +270,17 @@ impl Compiler {
                 let var_reg = self.materialize_users(users)?;
                 self.expr(*v, var_reg)?;
             }
+            ExtCall(extfn, e0, e1) => {
+                let a = self.gen_expr(*e0)?;
+                let b = self.gen_expr(*e1)?;
+                self.insts.push(UInst::Binary(
+                    Tag::ExtFn,
+                    ExtFnLabel::new(false, extfn.try_into().unwrap()).into(),
+                    a,
+                    b,
+                    r,
+                ));
+            }
             Add(expr, expr1) => todo!(),
             If(expr, expr1, expr2) => todo!(),
             Do(vec) => todo!(),
@@ -274,7 +288,6 @@ impl Compiler {
             Lam(vec, expr) => todo!(),
             Tup(vec) => todo!(),
             Untup(vec, expr, expr1) => todo!(),
-            ExtCall(_, expr, expr1) => todo!(),
             Lift(expr) => todo!(),
             Lower(expr) => todo!(),
         }

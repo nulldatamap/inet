@@ -3,7 +3,6 @@ use std::{
     mem,
     num::NonZeroUsize,
     ptr,
-    sync::atomic::{AtomicPtr, Ordering::Relaxed},
 };
 
 use crate::repr::*;
