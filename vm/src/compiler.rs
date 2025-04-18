@@ -44,6 +44,10 @@ pub fn print(a: Expr, b: Expr) -> Expr {
 pub fn seq(es: Vec<Expr>) -> Expr {
     Expr::Do(es)
 }
+pub fn lam(xs: Vec<&'static str>, b: Expr) -> Expr {
+    Expr::Lam(xs.iter().map(|x| x.to_string()).collect(), Box::new(b))
+}
+pub fn call(f: Expr, xs: Vec<Expr>) -> Expr { Expr::Call(Box::new(f), xs) }
 
 pub fn def(x: &'static str, e: Expr) -> Def {
     Def {
@@ -202,6 +206,16 @@ impl Compiler {
         self.insts.push(UInst::Binary(Tag::ExtFn, lbl, x, y, r))
     }
 
+    fn app(&mut self, f: Reg, x: Reg, res: Reg) {
+        self.insts
+            .push(UInst::Binary(Tag::Comb, CombLabel::Fn.into(), f, x, res));
+    }
+
+    fn lam(&mut self, x: Reg, b: Reg, res: Reg) {
+        self.insts
+            .push(UInst::Binary(Tag::Comb, CombLabel::Fn.into(), res, x, b));
+    }
+
     pub fn compile(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
         let mut c = Compiler::new();
 
@@ -312,9 +326,53 @@ impl Compiler {
                     self.val(r, 0);
                 }
             }
+            Call(f, mut es) => {
+                if es.is_empty() {
+                    // Call `f` with a dummy value
+                    es.push(Expr::I32(0));
+                }
+                // Generate:
+                //   f = fn(e0 fn(e1 fn(e2 r)))
+                let f_reg = es.into_iter().try_rfold(r, |tail, e| -> Result<Reg> {
+                    // f = fn(e tail)
+                    let f = self.gen();
+                    let x = self.gen_expr(e)?;
+                    self.app(f, x, tail);
+                    Ok(f)
+                })?;
+                self.expr(*f, f_reg)?;
+            }
+            Lam(prms, e) => {
+                for prm in &prms {
+                    self.scope.define(prm);
+                }
+                let body = self.gen_expr(*e)?;
+                let mut prm_users = prms
+                    .into_iter()
+                    .map(|prm| self.scope.undefine(&prm))
+                    .collect::<Vec<_>>();
+
+                if let Some(last_prm) = prm_users.pop() {
+                    // Generate:
+                    //   r = fn(x0 fn(x1 fn(x2 body)))
+                    let tail = prm_users
+                        .into_iter()
+                        .try_fold(r, |tail, us| -> Result<Reg> {
+                            let body = self.gen();
+                            let x = self.materialize_users(us)?;
+                            self.lam(x, body, tail);
+                            Ok(body)
+                        })?;
+                    let x = self.materialize_users(last_prm)?;
+                    self.lam(x, body, tail);
+                } else {
+                    // If there's no paramters, create a dummy one
+                    let x = self.gen();
+                    self.erase(x);
+                    self.lam(x, body, r);
+                }
+            }
             If(expr, expr1, expr2) => todo!(),
-            Call(expr, vec) => todo!(),
-            Lam(vec, expr) => todo!(),
             Tup(vec) => todo!(),
             Untup(vec, expr, expr1) => todo!(),
             Lift(expr) => todo!(),

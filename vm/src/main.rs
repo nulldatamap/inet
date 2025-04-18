@@ -19,12 +19,9 @@ fn main() {
     let mut rt = Rt::new(&h, Externals::builtins());
     let uprog = Compiler::compile(vec![
         def("main",
-            letv("io", i(1),
-                 print(v("io"), seq(vec![
-                     i(0),
-                     i(99)
-                 ]))
-            )),
+            lam(vec!["io"], print(v("io"), call(v("three"), vec![])))),
+        def("three", lam(vec![], i(3))),
+        def("id", lam(vec!["x"], v("x")))
     ])
     .unwrap();
     println!("{:?}", uprog);
