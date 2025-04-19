@@ -19,7 +19,7 @@ fn main() {
     let mut rt = Rt::new(&h, Externals::builtins());
     let uprog = Compiler::compile(vec![
         def("main",
-            lam(vec!["io"], print(v("io"), call(v("three"), vec![])))),
+            lam(vec!["io"], print(v("io"), if_(i(0), i(99), i(11))))),
         def("three", lam(vec![], i(3))),
         def("id", lam(vec!["x"], v("x")))
     ])

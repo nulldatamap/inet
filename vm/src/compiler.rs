@@ -6,7 +6,7 @@ use std::{
 use crate::{
     ext::Externals,
     program::*,
-    repr::{CombLabel, ExtFnLabel, Tag},
+    repr::{CombLabel, ExtFnLabel, OperatorLabel, Tag},
     Port,
 };
 
@@ -48,6 +48,7 @@ pub fn lam(xs: Vec<&'static str>, b: Expr) -> Expr {
     Expr::Lam(xs.iter().map(|x| x.to_string()).collect(), Box::new(b))
 }
 pub fn call(f: Expr, xs: Vec<Expr>) -> Expr { Expr::Call(Box::new(f), xs) }
+pub fn if_(c: Expr, t: Expr, f: Expr) -> Expr { Expr::If(Box::new(c), Box::new(t), Box::new(f)) }
 
 pub fn def(x: &'static str, e: Expr) -> Def {
     Def {
@@ -216,6 +217,13 @@ impl Compiler {
             .push(UInst::Binary(Tag::Comb, CombLabel::Fn.into(), res, x, b));
     }
 
+    fn branch(&mut self, c: Reg, t: Reg, f: Reg, res: Reg) {
+        // c = ?(?(t f) res)
+        let tf = self.gen();
+        self.insts.push(UInst::Binary(Tag::Operator, OperatorLabel::Branch.into(), c, tf, res));
+        self.insts.push(UInst::Binary(Tag::Operator, OperatorLabel::Branch.into(), tf, t, f));
+    }
+
     pub fn compile(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
         let mut c = Compiler::new();
 
@@ -372,7 +380,12 @@ impl Compiler {
                     self.lam(x, body, r);
                 }
             }
-            If(expr, expr1, expr2) => todo!(),
+            If(e0, e1, e2) => {
+                let c = self.gen_expr(*e0)?;
+                let t = self.gen_expr(*e1)?;
+                let f = self.gen_expr(*e2)?;
+                self.branch(c, t, f, r);
+            },
             Tup(vec) => todo!(),
             Untup(vec, expr, expr1) => todo!(),
             Lift(expr) => todo!(),

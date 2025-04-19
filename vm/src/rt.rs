@@ -143,8 +143,13 @@ impl<'h> Rt<'h> {
         self.execute(prog, p);
     }
 
-    fn branch(&mut self, a: Port<'h>, b: Port<'h>) {
-        todo!()
+    fn branch(&mut self, br: Port<'h>, c: Port<'h>) {
+        let (br_tf, res) = br.aux();
+        let (sel, p, q) = self.allocator.alloc_node(Tag::Operator, OperatorLabel::Branch.into());
+        let (t, f) = if c.to_extval() != 0 { (p, q) } else { (q, p) };
+        self.link_wire(t, Port::from_wire(res));
+        self.link_wire(f, Port::eraser());
+        self.link_wire(br_tf, sel);
     }
 
     fn call(&mut self, f: Port<'h>, x: Port<'h>) {

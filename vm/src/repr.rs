@@ -279,6 +279,11 @@ impl<'h> Port<'h> {
         self.label().into()
     }
 
+    pub fn op_label(&self) -> OperatorLabel {
+        debug_assert_eq!(self.tag(), Tag::Operator);
+        self.label().into()
+    }
+
     // SAFETY: `value` must actually be of lifetime `h`
     pub unsafe fn from_parts(tag: Tag, label: u16, value: *mut ()) -> Port<'h> {
         let v = value.map_addr(|x| x | (tag as u8 as usize) | ((label as usize) << LABEL_SHIFT));
@@ -394,7 +399,7 @@ impl<'h> fmt::Debug for Port<'h> {
             Tag::Eraser => write!(f, "_"),
             Tag::Global => write!(f, "G:{:08X}", self.addr().addr()),
             Tag::ExtFn => write!(f, "EXTFN:{:?}:{:08X}", self.extfn_label(), self.addr().addr()),
-            Tag::Operator => todo!(),
+            Tag::Operator => write!(f, "O:{:?}:{:08X}", self.op_label(), self.addr().addr()),
         }
     }
 }
