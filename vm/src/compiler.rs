@@ -19,7 +19,6 @@ pub enum Expr {
     Add(Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Let(String, Box<Expr>, Box<Expr>),
-    Do(Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Lam(Vec<String>, Box<Expr>),
     Tup(Vec<Expr>),
@@ -38,17 +37,31 @@ pub fn v(x: &'static str) -> Expr {
 pub fn letv(x: &'static str, v: Expr, b: Expr) -> Expr {
     Expr::Let(x.to_string(), Box::new(v), Box::new(b))
 }
+pub fn extcall(lbl: u16, a: Expr, b: Expr) -> Expr {
+    Expr::ExtCall(lbl, Box::new(a), Box::new(b))
+}
 pub fn print(a: Expr, b: Expr) -> Expr {
     Expr::ExtCall(Externals::PRINT, Box::new(a), Box::new(b))
-}
-pub fn seq(es: Vec<Expr>) -> Expr {
-    Expr::Do(es)
 }
 pub fn lam(xs: Vec<&'static str>, b: Expr) -> Expr {
     Expr::Lam(xs.iter().map(|x| x.to_string()).collect(), Box::new(b))
 }
-pub fn call(f: Expr, xs: Vec<Expr>) -> Expr { Expr::Call(Box::new(f), xs) }
-pub fn if_(c: Expr, t: Expr, f: Expr) -> Expr { Expr::If(Box::new(c), Box::new(t), Box::new(f)) }
+pub fn call(f: Expr, xs: Vec<Expr>) -> Expr {
+    Expr::Call(Box::new(f), xs)
+}
+pub fn if_(c: Expr, t: Expr, f: Expr) -> Expr {
+    Expr::If(Box::new(c), Box::new(t), Box::new(f))
+}
+pub fn tup(es: Vec<Expr>) -> Expr {
+    Expr::Tup(es)
+}
+pub fn untup(xs: Vec<&'static str>, tup: Expr, body: Expr) -> Expr {
+    Expr::Untup(
+        xs.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        Box::new(tup),
+        Box::new(body),
+    )
+}
 
 pub fn def(x: &'static str, e: Expr) -> Def {
     Def {
@@ -220,8 +233,25 @@ impl Compiler {
     fn branch(&mut self, c: Reg, t: Reg, f: Reg, res: Reg) {
         // c = ?(?(t f) res)
         let tf = self.gen();
-        self.insts.push(UInst::Binary(Tag::Operator, OperatorLabel::Branch.into(), c, tf, res));
-        self.insts.push(UInst::Binary(Tag::Operator, OperatorLabel::Branch.into(), tf, t, f));
+        self.insts.push(UInst::Binary(
+            Tag::Operator,
+            OperatorLabel::Branch.into(),
+            c,
+            tf,
+            res,
+        ));
+        self.insts.push(UInst::Binary(
+            Tag::Operator,
+            OperatorLabel::Branch.into(),
+            tf,
+            t,
+            f,
+        ));
+    }
+
+    fn tup(&mut self, a: Reg, b: Reg, res: Reg) {
+        self.insts
+            .push(UInst::Binary(Tag::Comb, CombLabel::Tup.into(), res, a, b));
     }
 
     pub fn compile(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
@@ -255,15 +285,13 @@ impl Compiler {
     }
 
     fn materialize_users(&mut self, mut users: Vec<Reg>) -> Result<Reg> {
-        // Reverse the user order so we preserve effect orders
-        users.reverse();
         if let Some(last) = users.pop() {
             if users.is_empty() {
                 // If there's exactly one user, just wire it up directly:
                 Ok(last)
             } else {
                 // Produce:
-                //   x = dup(u3 dup(u2 dup(u1 u0)))
+                //   x = dup(u0 dup(u1 dup(u2 u3)))
                 Ok(users.into_iter().rfold(last, |rhs, u| {
                     let r = self.gen();
                     self.dup(r, u, rhs);
@@ -276,6 +304,19 @@ impl Compiler {
             self.erase(r);
             Ok(r)
         }
+    }
+
+    fn scoped<'a, T>(
+        &'a mut self,
+        vars: &'a [String],
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(T, impl Iterator<Item = Vec<Reg>> + 'a)> {
+        for x in vars.iter() {
+            self.scope.define(x);
+        }
+        let res = f(self)?;
+        let us = vars.into_iter().map(|x| self.scope.undefine(&x));
+        Ok((res, us))
     }
 
     fn expr(&mut self, e: Expr, r: Reg) -> Result<()> {
@@ -296,10 +337,13 @@ impl Compiler {
                 }
             }
             Let(x, v, b) => {
-                self.scope.define(&x);
-                self.expr(*b, r)?;
-                let users = self.scope.undefine(&x);
-                let var_reg = self.materialize_users(users)?;
+                let user;
+                {
+                    let vars = &[x];
+                    let (_, mut users) = self.scoped(vars, |c| c.expr(*b, r))?;
+                    user = users.next().unwrap();
+                }
+                let var_reg = self.materialize_users(user)?;
                 self.expr(*v, var_reg)?;
             }
             ExtCall(extfn, e0, e1) => {
@@ -311,28 +355,6 @@ impl Compiler {
                 let a = self.gen_expr(*e0)?;
                 let b = self.gen_expr(*e1)?;
                 self.extcall(Externals::ADD, a, b, r);
-            }
-            Do(mut es) => {
-                if let Some(e_last) = es.pop() {
-                    if es.is_empty() {
-                        // Single expression? Just compile that directly
-                        self.expr(e_last, r)?;
-                    } else {
-                        // Generate:
-                        //   r = SEQ(SEQ(SEQ(e3 e2) e1) e0)
-                        let last = es.into_iter().try_fold(r, |prev_x, e_y| -> Result<Reg> {
-                            // prev_x = SEQ(x y)
-                            let x = self.gen();
-                            let y = self.gen_expr(e_y)?;
-                            self.extcall(Externals::SEQ, x, y, prev_x);
-                            Ok(x)
-                        })?;
-                        self.expr(e_last, last)?;
-                    }
-                } else {
-                    // Empty seq, return "nil"
-                    self.val(r, 0);
-                }
             }
             Call(f, mut es) => {
                 if es.is_empty() {
@@ -351,14 +373,8 @@ impl Compiler {
                 self.expr(*f, f_reg)?;
             }
             Lam(prms, e) => {
-                for prm in &prms {
-                    self.scope.define(prm);
-                }
-                let body = self.gen_expr(*e)?;
-                let mut prm_users = prms
-                    .into_iter()
-                    .map(|prm| self.scope.undefine(&prm))
-                    .collect::<Vec<_>>();
+                let (body, prm_users) = self.scoped(&prms, |c| c.gen_expr(*e))?;
+                let mut prm_users = prm_users.collect::<Vec<_>>();
 
                 if let Some(last_prm) = prm_users.pop() {
                     // Generate:
@@ -385,9 +401,42 @@ impl Compiler {
                 let t = self.gen_expr(*e1)?;
                 let f = self.gen_expr(*e2)?;
                 self.branch(c, t, f, r);
-            },
-            Tup(vec) => todo!(),
-            Untup(vec, expr, expr1) => todo!(),
+            }
+            Tup(mut es) => {
+                if es.len() < 2 {
+                    return Err(
+                        "Invalid AST, invalid tuple, needs at least two elements".to_string()
+                    );
+                }
+                // r = tup(e0 tup(e1 tup(e2 e3)))
+                let last_elm = es.pop().unwrap();
+                let tail = es.into_iter().try_fold(r, |acc, e| -> Result<Reg> {
+                    // acc = tup(e r)
+                    let r = self.gen();
+                    let l = self.gen_expr(e)?;
+                    self.tup(l, r, acc);
+                    Ok(r)
+                })?;
+                self.expr(last_elm, tail)?;
+            }
+            Untup(xs, tup, body) => {
+                if xs.len() < 2 {
+                    return Err(
+                        "Invalid AST, invalid un-tuple, needs at least two parameters".to_string(),
+                    );
+                }
+                let (_, users) = self.scoped(&xs, |c| c.expr(*body, r))?;
+                let mut users = users.collect::<Vec<_>>();
+                let last_user = users.pop().unwrap();
+                let last = self.materialize_users(last_user)?;
+                let untup = users.into_iter().try_rfold(last, |r, us| -> Result<Reg> {
+                    let res = self.gen();
+                    let l = self.materialize_users(us)?;
+                    self.tup(l, r, res);
+                    Ok(res)
+                })?;
+                self.expr(*tup, untup)?;
+            }
             Lift(expr) => todo!(),
             Lower(expr) => todo!(),
         }
