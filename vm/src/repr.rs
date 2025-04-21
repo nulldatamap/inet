@@ -2,6 +2,7 @@ use core::fmt;
 use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 use std::{marker::PhantomData, ptr::NonNull};
 
+use crate::ext::{ExtVal, Externals};
 use crate::program::Program;
 
 pub struct Wire<'h>(&'h Word);
@@ -29,6 +30,7 @@ impl<'h> Wire<'h> {
     pub fn swap(&self, p: Option<Port<'h>>) -> Option<Port<'h>> {
         // SAFETY: The loaded value is of lifetime `h` because the Wire is
         unsafe {
+            // SAFETY: for `Port::raw()` safety, see `store`
             Port::option_from_raw(
                 self.0
                     .swap(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut())),
@@ -37,8 +39,12 @@ impl<'h> Wire<'h> {
     }
 
     pub fn store(&self, p: Option<Port<'h>>) {
-        self.0
-            .store(p.map(|x| x.raw().as_ptr()).unwrap_or(std::ptr::null_mut()))
+        // SAFETY: The port (if present) goes onto the heap in pointer form
+        //         But that pointer is only ever read back as a Port
+        self.0.store(
+            p.map(|x| unsafe { x.raw() }.as_ptr())
+                .unwrap_or(std::ptr::null_mut()),
+        )
     }
 }
 
@@ -251,12 +257,12 @@ impl Into<u16> for ExtFnLabel {
 impl fmt::Debug for ExtFnLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (fl, i) = self.get();
-        if fl { write!(f, "'")?; }
+        if fl {
+            write!(f, "'")?;
+        }
         write!(f, "{}", i)
     }
 }
-
-pub type ExtVal = i32;
 
 #[repr(transparent)]
 pub struct Port<'h>(NonNull<()>, PhantomData<&'h ()>);
@@ -308,26 +314,18 @@ impl<'h> Port<'h> {
         }
     }
 
-    pub fn from_extval(e: ExtVal) -> Port<'static> {
-        // SAFETY: The value is not a pointer, hence 'static
+    pub fn from_extval(e: ExtVal<'h>) -> Port<'h> {
+        // SAFETY: We know the raw pointer is not null now because of the tag
         unsafe {
-            Port::from_parts(
-                Tag::ExtVal,
-                0,
-                std::ptr::null_mut::<()>().map_addr(|_| (e << TAG_SHIFT) as usize),
-            )
+            Port::from_raw(NonNull::new_unchecked(
+                e.raw().map_addr(|x| x | Tag::ExtVal as u8 as usize),
+            ))
         }
     }
 
     pub fn from_global(g: NonNull<Program<'h>>) -> Port<'h> {
         // SAFETY: The value is from a 'h ref, so it's all good
-        unsafe {
-            Port::from_parts(
-                Tag::Global,
-                0,
-                g.as_ptr() as *mut ()
-            )
-        }
+        unsafe { Port::from_parts(Tag::Global, 0, g.as_ptr() as *mut ()) }
     }
 
     pub fn eraser() -> Port<'static> {
@@ -335,8 +333,13 @@ impl<'h> Port<'h> {
         unsafe { Port::from_parts(Tag::Eraser, 0, std::ptr::null_mut()) }
     }
 
-    pub fn raw(&self) -> NonNull<()> {
-        self.0
+    // SAFETY: Code using the pointer must still respect it's uniqueness
+    //         Or manunally enforce reference-counting
+    pub unsafe fn raw(self) -> NonNull<()> {
+        let r = self.0;
+        // Don't drop self, since it's "ownership" is transferred with the pointer
+        std::mem::forget(self);
+        r
     }
 
     pub fn addr(&self) -> *mut () {
@@ -365,8 +368,10 @@ impl<'h> Port<'h> {
         unsafe { self.addr().cast::<Program<'h>>().as_ref().unwrap() }
     }
 
-    pub fn to_extval(self) -> ExtVal {
-        (self.addr().addr() >> TAG_SHIFT).try_into().unwrap()
+    pub fn to_extval(self) -> ExtVal<'h> {
+        debug_assert_eq!(self.tag(), Tag::ExtVal);
+        // SAFETY: All ExtVal ports should have been created from valid ExtVals
+        unsafe { ExtVal::from_raw(self.raw().as_ptr().map_addr(|x| x & !TAG_MASK)) }
     }
 
     pub fn aux(&self) -> (Wire<'h>, Wire<'h>) {
@@ -383,6 +388,32 @@ impl<'h> Port<'h> {
             Wire::from_ref(unsafe { aux_ptr.offset(1).as_ref().unwrap() }),
         )
     }
+
+    // SAFETY: This copy of the prot should never be obvservable
+    pub(crate) unsafe fn blit(&self) -> Port<'h> {
+        Port(self.0, self.1)
+    }
+
+    pub fn dup(&self) -> Port<'h> {
+        if self.tag() == Tag::ExtVal {
+            // SAFETY: The blit is safe because we forget the value later
+            let x0 = unsafe { self.blit() }.to_extval();
+            let x1 = x0.dup();
+            // "Forget" the original extval because it's still owned in the form
+            // of the Port `self`
+            std::mem::forget(x0);
+            Self::from_extval(x1)
+        } else {
+            // Non-ExtVal can just be blit'ed
+            Port(self.0, self.1)
+        }
+    }
+
+    pub fn erase(self, exts: &Externals) {
+        if self.tag() == Tag::ExtVal {
+            self.to_extval().erase(exts);
+        }
+    }
 }
 
 impl<'h> fmt::Debug for Port<'h> {
@@ -395,10 +426,20 @@ impl<'h> fmt::Debug for Port<'h> {
                 self.addr().addr()
             ),
             Tag::Wire => write!(f, "W:{:08X}", self.addr().addr()),
-            Tag::ExtVal => write!(f, "EXTVAL:{:08X}", self.addr().addr() >> TAG_SHIFT),
+            Tag::ExtVal => {
+                let x = unsafe { self.blit().to_extval() };
+                x.fmt(f)?;
+                std::mem::forget(x);
+                Ok(())
+            }
             Tag::Eraser => write!(f, "_"),
             Tag::Global => write!(f, "G:{:08X}", self.addr().addr()),
-            Tag::ExtFn => write!(f, "EXTFN:{:?}:{:08X}", self.extfn_label(), self.addr().addr()),
+            Tag::ExtFn => write!(
+                f,
+                "EXTFN:{:?}:{:08X}",
+                self.extfn_label(),
+                self.addr().addr()
+            ),
             Tag::Operator => write!(f, "O:{:?}:{:08X}", self.op_label(), self.addr().addr()),
         }
     }
@@ -416,6 +457,10 @@ impl Clone for Port<'static> {
 #[cfg(debug_assertions)]
 impl<'h> Drop for Port<'h> {
     fn drop(&mut self) {
-        // TODO: Assert for ref-counted ext-vals that they are truely dropped
+        // Cell ExtVal ports are not allowed to be dropped
+        // Instead they should be turned into ExtVals dealt with that way
+        if self.tag() == Tag::ExtVal {
+            let _ = std::mem::replace(self, Port::eraser()).to_extval();
+        }
     }
 }

@@ -1,6 +1,12 @@
 use core::fmt;
+use std::any::TypeId;
 
-use crate::{ext::Externals, heap::*, program::*, repr::*};
+use crate::{
+    ext::{ExtVal, Externals, UniqueCell},
+    heap::*,
+    program::*,
+    repr::*,
+};
 
 macro_rules! sym {
     ($p:pat) => {
@@ -37,14 +43,6 @@ impl<'h> Rt<'h> {
         }
     }
 
-    pub fn dup(&mut self, p: &Port<'h>) -> Port<'h> {
-        // TODO: Proper dup'ing
-        unsafe { Port::option_from_raw(p.raw().as_ptr()).unwrap() }
-    }
-
-    // TODO: Proper erasing
-    pub fn erase(&mut self, p: Port<'h>) {}
-
     fn follow_wire(&mut self, mut p: Port<'h>) -> Port<'h> {
         while p.tag() == Tag::Wire {
             let w = p.to_wire();
@@ -60,9 +58,19 @@ impl<'h> Rt<'h> {
 
     fn link_wire(&mut self, w: Wire<'h>, p: Port<'h>) {
         let p = self.follow_wire(p);
-        if let Some(old_x) = w.swap(Some(self.dup(&p))) {
+        // SAFETY: It's safe to blit `p` here because:
+        //         - If the wire we put it into was empty, then we
+        //           forgot about the other copy, and the effect was non-copying
+        //         - If the wire wasn't empty, then it gets overwritten (forgetting the blitted `p`)
+        //           And then `p` is just used
+        if let Some(old_x) = w.swap(Some(unsafe { p.blit() })) {
             self.allocator.free_wire(w);
             self.link(old_x, p);
+        } else {
+            // We forget `p` here because we stored a blitted copy in the wire
+            // Since it's going to stay there, we want to forget this copy
+            // so that it doesn't get dropped at the end of this scope
+            std::mem::forget(p);
         }
     }
 
@@ -70,8 +78,8 @@ impl<'h> Rt<'h> {
         match ((a.tag(), a), (b.tag(), b)) {
             sym!((Tag::Wire, a), (_, b)) => self.link_wire(a.to_wire(), b),
             sym!(Tag::Eraser | Tag::Global, a, b) | sym!(Tag::Eraser | Tag::ExtVal, a, b) => {
-                self.erase(a);
-                self.erase(b);
+                a.erase(&self.externals);
+                b.erase(&self.externals)
             }
             ((_, a), (_, b)) => {
                 // TODO: Split into both slow and fast
@@ -106,8 +114,7 @@ impl<'h> Rt<'h> {
 
     fn copy(&mut self, a: Port<'h>, b: Port<'h>) {
         let (l, r) = b.aux();
-        let a0 = self.dup(&a);
-        self.link_wire(l, a0);
+        self.link_wire(l, a.dup());
         self.link_wire(r, a);
     }
 
@@ -145,8 +152,14 @@ impl<'h> Rt<'h> {
 
     fn branch(&mut self, br: Port<'h>, c: Port<'h>) {
         let (br_tf, res) = br.aux();
-        let (sel, p, q) = self.allocator.alloc_node(Tag::Operator, OperatorLabel::Branch.into());
-        let (t, f) = if c.to_extval() != 0 { (p, q) } else { (q, p) };
+        let (sel, p, q) = self
+            .allocator
+            .alloc_node(Tag::Operator, OperatorLabel::Branch.into());
+        let (t, f) = if c.to_extval().is_truthy() {
+            (p, q)
+        } else {
+            (q, p)
+        };
         self.link_wire(t, Port::from_wire(res));
         self.link_wire(f, Port::eraser());
         self.link_wire(br_tf, sel);
@@ -189,7 +202,7 @@ impl<'h> Rt<'h> {
         for inst in &prog.instructions {
             match inst {
                 &Inst::Nilary(r, ref v) => {
-                    let v = self.dup(v);
+                    let v = v.dup();
                     self.link_register(r, v);
                 }
                 &Inst::Binary(tag, lbl, a, l, r) => {
@@ -203,6 +216,22 @@ impl<'h> Rt<'h> {
 
         debug_assert!(self.registers.iter().all(|r| r.is_none()));
     }
+
+    pub fn get_cell<'a, T: Sync + 'static>(&self, v: &'a ExtVal<'h>) -> &'a T {
+        debug_assert!(self.externals.is_type::<T>(v.ty()));
+        // SAFETY: We've validated the TypeId of T
+        unsafe { v.get_ref_unchecked() }
+    }
+
+    pub fn get_unique<T: Sync + 'static>(&self, v: ExtVal<'h>) -> UniqueCell<T> {
+        debug_assert!(self.externals.is_type::<T>(v.ty()));
+        // SAFETY: We've validated the TypeId of T
+        unsafe { v.get_unique_unchecked() }
+    }
+
+    pub fn erase(&self, p: ExtVal<'h>) {
+        p.erase(&self.externals);
+    }
 }
 
 impl<'h> fmt::Debug for Rt<'h> {
@@ -211,7 +240,8 @@ impl<'h> fmt::Debug for Rt<'h> {
             let v = unsafe { Port::option_from_raw(w.load()) };
             write!(f, "{:08X}: ", w as *const Word as usize)?;
             if let Some(p) = v {
-                write!(f, "{:?}\n", p)?;
+                write!(f, "{:?}\n", &p)?;
+                std::mem::forget(p);
             } else {
                 write!(f, "-\n")?;
             }

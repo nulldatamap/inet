@@ -1,5 +1,7 @@
 use core::fmt;
-use std::{cell::UnsafeCell, collections::HashMap, marker::PhantomPinned, num::NonZeroUsize, ptr::NonNull};
+use std::{
+    cell::UnsafeCell, collections::HashMap, marker::PhantomPinned, num::NonZeroUsize, ptr::NonNull,
+};
 
 use crate::repr::{CombLabel, ExtFnLabel, OperatorLabel, Port, Tag};
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    ext::Externals,
+    ext::{ExtVal, Externals},
     program::*,
     repr::{CombLabel, ExtFnLabel, OperatorLabel, Tag},
     Port,
@@ -186,7 +186,8 @@ impl Compiler {
     }
 
     fn val(&mut self, r: Reg, x: i32) {
-        self.insts.push(UInst::Nilary(r, Port::from_extval(x)));
+        self.insts
+            .push(UInst::Nilary(r, Port::from_extval(ExtVal::i32(x))));
     }
 
     fn erase(&mut self, r: Reg) {

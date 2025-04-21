@@ -1,3 +1,4 @@
+#![feature(thin_box, ptr_metadata)]
 mod compiler;
 mod ext;
 mod heap;
@@ -6,6 +7,7 @@ mod repr;
 mod rt;
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use compiler::*;
 use ext::*;
@@ -35,10 +37,16 @@ fn main() {
     .unwrap();
     println!("{:?}", uprog);
     let globals = link_programs(&uprog).unwrap();
+    let io = ExtVal::cell(
+        Externals::IO_TY,
+        IoHandle {
+            op_count: AtomicUsize::new(0),
+        },
+    );
 
     rt.link(
         Port::from_global(globals.get("main").unwrap()),
-        Port::from_extval(3),
+        Port::from_extval(io.dup()),
     );
 
     println!("{:?}", rt);
@@ -56,4 +64,10 @@ fn main() {
             break;
         }
     }
+
+    let io = rt.get_unique::<IoHandle>(io);
+    println!(
+        "IO actions performed: {}\n",
+        io.op_count.load(Ordering::Relaxed)
+    );
 }
