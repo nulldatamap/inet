@@ -1,5 +1,4 @@
 use core::fmt;
-use std::any::TypeId;
 
 use crate::{
     ext::{ExtVal, Externals, UniqueCell},

@@ -2,7 +2,6 @@ use bitflags::{bitflags, Flags};
 use std::{
     alloc::Layout,
     any::TypeId,
-    boxed::ThinBox,
     fmt,
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -12,11 +11,9 @@ use std::{
 
 use crate::rt::Rt;
 
-// Like Arc, but:
-// - No weak pointers
-// - The pointer is always thin (so we can store arrays)
-// - Type information is externalized to ExtTyDesc (i.e. layout, drop + vtable)
-#[repr(align(16))]
+// rerpr(C) because the ref_count should always be the first field (and the payload the last)
+// (Thanks -Zrandomize-layout)
+#[repr(C, align(16))]
 struct CellInner<T> {
     ref_count: AtomicUsize,
     payload: T,
@@ -84,6 +81,7 @@ impl<T> Drop for UniqueCell<T> {
     }
 }
 
+#[repr(transparent)]
 struct SharedCell(NonNull<CellInner<()>>);
 
 impl SharedCell {
@@ -244,6 +242,7 @@ impl ExtTyDesc {
     }
 }
 
+#[repr(transparent)]
 pub struct ExtVal<'h>(*mut (), PhantomData<&'h ()>);
 
 impl<'h> ExtVal<'h> {

@@ -5,6 +5,7 @@ use std::{marker::PhantomData, ptr::NonNull};
 use crate::ext::{ExtVal, Externals};
 use crate::program::Program;
 
+#[repr(transparent)]
 pub struct Wire<'h>(&'h Word);
 
 impl<'h> Wire<'h> {
@@ -87,7 +88,7 @@ impl Clone for Word {
     }
 }
 
-#[repr(align(16))]
+#[repr(C, align(16))]
 #[derive(Default, Clone)]
 pub struct WordPair(pub(crate) Word, pub(crate) Word);
 

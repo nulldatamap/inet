@@ -6,7 +6,7 @@ use std::{
 use crate::{
     ext::{ExtVal, Externals},
     program::*,
-    repr::{CombLabel, ExtFnLabel, OperatorLabel, Tag},
+    repr::{CombLabel, OperatorLabel, Tag},
     Port,
 };
 
