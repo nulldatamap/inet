@@ -9,8 +9,25 @@ use crate::program::Program;
 pub struct Wire<'h>(&'h Word);
 
 impl<'h> Wire<'h> {
-    pub fn to_ref(self) -> &'h Word {
+    const HALF_BIT: usize = std::mem::align_of::<Word>();
+
+    pub fn as_ref(&self) -> &'h Word {
         self.0
+    }
+
+    pub fn other_half(&self) -> &'h Word {
+        // SAFETY: All words are allocated in WordPair blocks, and share the same lifetime
+        unsafe { (self.0 as *const Word).map_addr(|x| x ^ Self::HALF_BIT).as_ref_unchecked() }
+    }
+
+    pub fn left_half(&self) -> &'h Word {
+        // SAFETY: See `other_half`
+        unsafe { (self.0 as *const Word).map_addr(|x| x & !Self::HALF_BIT).as_ref_unchecked() }
+    }
+
+    pub fn to_pair(&self) -> &'h WordPair {
+        // SAFETY: See `other_half`
+        unsafe { (self.0 as *const Word).map_addr(|x| x & !Self::HALF_BIT).cast::<WordPair>().as_ref_unchecked() }
     }
 
     pub fn to_ptr(self) -> NonNull<Word> {
@@ -65,6 +82,10 @@ impl Word {
 
     pub fn swap(&self, v: *mut ()) -> *mut () {
         self.0.swap(v, Relaxed)
+    }
+
+    pub fn compare_exchange(&self, x: *mut (), y: *mut ()) -> Result<*mut (), *mut ()> {
+        self.0.compare_exchange(x, y, Relaxed, Relaxed)
     }
 
     pub fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self {

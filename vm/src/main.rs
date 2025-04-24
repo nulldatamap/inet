@@ -1,4 +1,4 @@
-#![feature(thin_box, ptr_metadata)]
+#![feature(thin_box, ptr_metadata, ptr_as_ref_unchecked, non_null_from_ref)]
 mod compiler;
 mod ext;
 mod heap;
@@ -27,7 +27,7 @@ fn main() {
                 untup(
                     vec!["x", "y", "z", "w"],
                     tup(vec![i(3), i(4), i(5), i(6)]),
-                    print(print(print(print(v("io"), v("x")), v("y")), v("z")), v("w")),
+                    print(print(print(print(v("io"), v("x")), v("y")), v("z")), call(v("id"), vec![v("w")])),
                 ),
             ),
         ),
