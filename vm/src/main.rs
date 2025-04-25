@@ -1,4 +1,4 @@
-#![feature(thin_box, ptr_metadata, ptr_as_ref_unchecked, non_null_from_ref)]
+#![feature(thin_box, ptr_metadata, ptr_as_ref_unchecked, non_null_from_ref, unsize, layout_for_ptr)]
 mod compiler;
 mod ext;
 mod heap;
@@ -24,11 +24,8 @@ fn main() {
             "main",
             lam(
                 vec!["io"],
-                untup(
-                    vec!["x", "y", "z", "w"],
-                    tup(vec![i(3), i(4), i(5), i(6)]),
-                    print(print(print(print(v("io"), v("x")), v("y")), v("z")), call(v("id"), vec![v("w")])),
-                ),
+                letv("x", extcall(3, i(1), extcall(3, i(3), i(1))),
+                print(print(v("io"), v("x")), v("x"))),
             ),
         ),
         def("three", lam(vec![], i(3))),
@@ -70,4 +67,5 @@ fn main() {
         "IO actions performed: {}\n",
         io.op_count.load(Ordering::Relaxed)
     );
+    rt.erase_unique(io);
 }

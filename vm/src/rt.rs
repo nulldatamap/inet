@@ -1,7 +1,7 @@
 use core::fmt;
 
 use crate::{
-    ext::{ExtVal, Externals, UniqueCell},
+    ext::{ExtVal, Externals, Tracked, UniqueCell},
     heap::*,
     program::*,
     repr::*,
@@ -231,6 +231,13 @@ impl<'h> Rt<'h> {
     pub fn erase(&self, p: ExtVal<'h>) {
         p.erase(&self.externals);
     }
+
+    pub fn erase_unique<T: Tracked>(&self, mut u: UniqueCell<T>) {
+        // SAFETY: it's safe to erase the cell in place because we forget it right afterwards
+        unsafe { u.erase_in_place(&self.externals); }
+        std::mem::forget(u);
+    }
+
 }
 
 impl<'h> fmt::Debug for Rt<'h> {

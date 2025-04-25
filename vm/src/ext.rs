@@ -3,52 +3,100 @@ use std::{
     alloc::Layout,
     any::TypeId,
     fmt,
-    marker::PhantomData,
+    marker::{PhantomData, Unsize},
     ops::{Deref, DerefMut},
-    ptr::{DynMetadata, NonNull},
+    ptr::{metadata, DynMetadata, NonNull, Pointee},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::rt::Rt;
 
+#[repr(C, align(16))]
+#[derive(Debug)]
+struct CellHeader<M> {
+    ref_count: AtomicUsize,
+    metadata: M,
+}
+
 // rerpr(C) because the ref_count should always be the first field (and the payload the last)
 // (Thanks -Zrandomize-layout)
 #[repr(C, align(16))]
-struct CellInner<T> {
-    ref_count: AtomicUsize,
+struct CellInner<T: Pointee + ?Sized> {
+    header: CellHeader<<T as Pointee>::Metadata>,
     payload: T,
 }
 
 #[repr(transparent)]
-pub struct UniqueCell<T>(NonNull<CellInner<T>>);
+#[derive(Debug)]
+pub struct UniqueCell<T: Pointee + ?Sized>(
+    NonNull<CellHeader<<T as Pointee>::Metadata>>,
+    PhantomData<T>,
+);
+
+pub trait Tracked {
+    // SAFETY: The value must not be used after this call nor may it be dropped
+    //         Instead this serves as a Drop replacement
+    unsafe fn erase_in_place(&mut self, ext: &Externals);
+}
+
+impl<'h> Tracked for [ExtVal<'h>] {
+    unsafe fn erase_in_place(&mut self, ext: &Externals) {
+        for v in self {
+            v.erase_in_place(ext);
+        }
+    }
+}
+
+trait ExtVTable: Tracked {}
+impl<T: ?Sized + Tracked> ExtVTable for UniqueCell<T> {}
+
+macro_rules! prim_tracked {
+    ($($ty:ty),*) => { $(impl Tracked for $ty { unsafe fn erase_in_place(&mut self, _exts: &Externals) {} })* }
+}
+prim_tracked!((), u8, i8, u16, i16, u32, i32, i64, u64, usize, isize);
 
 impl<T> UniqueCell<T> {
     fn new(data: T) -> Self {
         // SAFETY: Layout can't be zero because we've got the ref_counter
         let ptr: *mut CellInner<T> = unsafe { std::alloc::alloc(Self::layout()) }.cast();
-        // SAFETY: ptr is valid and aligned because it's either:
-        //         - Dangling (for ZST, which are always valid)
-        //         - Freshly `alloc`ed and hence aligned and valid
+        // SAFETY: ptr is valid and aligned because it's freshly `alloc`ed and hence aligned and valid
         unsafe {
             ptr.write(CellInner {
-                ref_count: AtomicUsize::new(1),
+                header: CellHeader {
+                    ref_count: AtomicUsize::new(1),
+                    metadata: metadata((&raw mut (*ptr).payload)),
+                },
                 payload: data,
             });
         }
         // SAFETY: Can't be null
-        UniqueCell(unsafe { NonNull::new_unchecked(&raw mut *ptr) })
+        let u = UniqueCell::<T>(
+            unsafe { NonNull::new_unchecked(&raw mut *ptr).cast() },
+            PhantomData,
+        );
+        debug_assert_eq!(UniqueCell::<T>::layout(), u.recover_layout());
+        u
     }
 
     fn layout() -> Layout {
         Layout::new::<CellInner<T>>()
     }
+}
 
-    fn inner(&self) -> &CellInner<T> {
-        unsafe { &*self.0.as_ptr() }
+impl<T: ?Sized> UniqueCell<T> {
+    fn cell_ptr(&self) -> *const CellInner<T> {
+        // SAFETY: Unique cells should have be made from inner cell:
+        unsafe {
+            std::ptr::from_raw_parts::<CellInner<T>>(self.0.as_ptr(), (*self.0.as_ptr()).metadata)
+        }
+    }
+    fn recover_layout(&self) -> Layout {
+        // SAFETY: Due to constraints of unsized UniqueCell, this show always be valid:
+        unsafe { Layout::for_value_raw::<CellInner<T>>(self.cell_ptr()) }
     }
 
-    fn inner_mut(&mut self) -> &mut CellInner<T> {
-        unsafe { &mut *self.0.as_ptr() }
+    fn header(&self) -> &CellHeader<<T as Pointee>::Metadata> {
+        unsafe { &*self.0.as_ptr() }
     }
 
     fn into_shared(self) -> SharedCell {
@@ -59,38 +107,129 @@ impl<T> UniqueCell<T> {
     }
 }
 
-impl<T> Deref for UniqueCell<T> {
+impl<T> UniqueCell<[T]> {
+    fn array_layout(n: usize) -> Layout {
+        Layout::new::<CellHeader<<[T] as Pointee>::Metadata>>()
+            .extend(Layout::array::<T>(n).unwrap())
+            .unwrap()
+            .0
+            .pad_to_align()
+    }
+
+    fn from_array<U: Unsize<[T]>>(data: U) -> Self {
+        // SAFETY: See `UniqueCell::new`
+        let n = {
+            let data: &[T] = &data;
+            data.len()
+        };
+        let ptr: *mut CellInner<U> = unsafe { std::alloc::alloc(Self::array_layout(n)) }.cast();
+        // SAFETY: See `UniqueCell::new`
+        unsafe {
+            ptr.write(CellInner {
+                header: CellHeader {
+                    ref_count: AtomicUsize::new(1),
+                    // NOTE: We're going from U (Sized) to T (Unsized)
+                    metadata: metadata(&(*ptr).payload),
+                },
+                payload: data,
+            });
+        }
+        // SAFETY: Can't be null
+        let u = UniqueCell::<[T]>(
+            unsafe { NonNull::new_unchecked(&raw mut *ptr).cast() },
+            PhantomData,
+        );
+
+        debug_assert_eq!(UniqueCell::<U>::layout(), u.recover_layout());
+        debug_assert_eq!(UniqueCell::<U>::layout(), Self::array_layout(n));
+        u
+    }
+
+    fn new_array(n: usize, mut f: impl FnMut() -> T) -> Self {
+        // SAFETY: See `UniqueCell::new`
+        let ptr: *mut CellInner<[T; 0]> =
+            unsafe { std::alloc::alloc(Self::array_layout(n)) }.cast();
+        // SAFETY: The header field should be valid from the alloc
+        unsafe {
+            (&raw mut (*ptr).header)
+                .cast::<CellHeader<<[T] as Pointee>::Metadata>>()
+                .write(CellHeader {
+                    ref_count: AtomicUsize::new(1),
+                    metadata: n,
+                });
+        };
+        // Initialize the data
+        let data = (&raw mut (unsafe { &mut *ptr }).payload).cast::<T>();
+        for i in 0..(n as isize) {
+            unsafe { data.offset(i).write(f()) };
+        }
+
+        // SAFETY: Can't be null
+        let u = UniqueCell::<[T]>(
+            unsafe { NonNull::new_unchecked(&raw mut *ptr).cast() },
+            PhantomData,
+        );
+
+        debug_assert_eq!(Self::array_layout(n), u.recover_layout());
+        u
+    }
+}
+
+impl<T: ?Sized> Deref for UniqueCell<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner().payload
+        // SAFETY: We get a thin pointer to the start of the payload
+        //         Then using the metadata stored when we created the cell
+        //         we can safely reconstiute a (possibly) fat pointer (in case of a DST)
+        unsafe {
+            std::ptr::from_raw_parts::<Self::Target>(
+                &raw const (*(self.0.as_ptr() as *const CellInner<()>)).payload,
+                (*self.0.as_ptr()).metadata,
+            )
+            .as_ref_unchecked()
+        }
     }
 }
 
-impl<T> DerefMut for UniqueCell<T> {
+impl<T: ?Sized> DerefMut for UniqueCell<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner_mut().payload
+        // SAFETY: See `deref`
+        unsafe {
+            std::ptr::from_raw_parts_mut::<Self::Target>(
+                &raw mut ((*(self.0.as_ptr() as *mut CellInner<()>)).payload),
+                (*self.0.as_ptr()).metadata,
+            )
+            .as_mut_unchecked()
+        }
     }
 }
 
-impl<T> Drop for UniqueCell<T> {
+impl<T: ?Sized> Drop for UniqueCell<T> {
     fn drop(&mut self) {
-        unsafe { std::ptr::drop_in_place::<T>(self.deref_mut()) };
+        panic!("UniqueCell is not allowed to be dropped. Did you forget to call erase on it? ");
+    }
+}
+
+impl<T: ?Sized + Tracked> Tracked for UniqueCell<T> {
+    unsafe fn erase_in_place(&mut self, exts: &Externals) {
+        println!("Erasing UniqueCell: {:08X}", self.0.as_ptr().addr());
+        unsafe { self.deref_mut().erase_in_place(exts) };
         // SAFETY: Pointer and layout should be matching
-        unsafe { std::alloc::dealloc(self.0.as_ptr().cast(), Self::layout()) };
+        unsafe { std::alloc::dealloc(self.0.as_ptr().cast(), self.recover_layout()) };
     }
 }
 
 #[repr(transparent)]
-struct SharedCell(NonNull<CellInner<()>>);
+struct SharedCell(NonNull<CellHeader<()>>);
 
 impl SharedCell {
     // SAFETY: `self` must have come from a matching Cell<T>::into_untyped
     unsafe fn into_unique<T>(self) -> UniqueCell<T> {
-        if self.inner().ref_count.load(Ordering::Acquire) != 1 {
+        if self.header().ref_count.load(Ordering::Acquire) != 1 {
             panic!("Trying to turn a SharedCell into a UniqueOnce, but there's still other references to it");
         }
-        let c = UniqueCell(self.0.cast());
+        let c = UniqueCell(self.0.cast(), PhantomData);
         // Ownership is transferred to the pointer
         std::mem::forget(self);
         c
@@ -106,11 +245,11 @@ impl SharedCell {
     }
 
     // SAFETY: `ptr` must have come from UntypedCell::to_ptr
-    unsafe fn from_raw(ptr: NonNull<CellInner<()>>) -> SharedCell {
+    unsafe fn from_raw(ptr: NonNull<CellHeader<()>>) -> SharedCell {
         SharedCell(ptr)
     }
 
-    fn inner(&self) -> &CellInner<()> {
+    fn header(&self) -> &CellHeader<()> {
         // SAFETY: This Cell being alive means that the inner pointer should still be valid
         unsafe { &*self.0.as_ptr() }
     }
@@ -125,38 +264,41 @@ impl SharedCell {
     }
 
     fn dup(&self) -> SharedCell {
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        self.header().ref_count.fetch_add(1, Ordering::Relaxed);
         SharedCell(self.0)
     }
 
     // SAFETY: It's only safe to drop the inner cell value if there are
     //         No other references to it left
-    unsafe fn drop_inner(self, vtable: DynMetadata<dyn Sync>) {
+    unsafe fn erase_inner(mut self, vtable: DynMetadata<dyn ExtVTable>, exts: &Externals) {
+        println!("DROP INNER: {:08X}", self.0.addr().get());
         // SAFETY: As long as type tags are valid, then the vtable should be valid
         //         For this pointer:
-        let dropable_ptr: *mut dyn Sync = std::ptr::from_raw_parts_mut(self.0.as_ptr(), vtable);
-        // SAFETY: CellInner drop_in_place should valid because the true type should match
-        std::ptr::drop_in_place(dropable_ptr);
-        // SAFETY: The pointer comes from alloc with the same layout, so it's safe to dealloc
-        std::alloc::dealloc(self.0.as_ptr().cast(), vtable.layout());
-        // We've already dropped the "true" value, so forget this one
+        let dropable_ptr: *mut dyn ExtVTable = std::ptr::from_raw_parts_mut(&raw mut self, vtable);
+        // SAFETY: Shared cells should have be made from UniqueCell, so this should be valid
+        dropable_ptr.as_mut_unchecked().erase_in_place(exts);
+        // We've already dropped the "true" value, so forget these ones
         std::mem::forget(self);
     }
 
-    fn erase(self, vtable: DynMetadata<dyn Sync>) {
-        if self.inner().ref_count.fetch_sub(1, Ordering::Release) != 1 {
+    fn erase(self, vtable: DynMetadata<dyn ExtVTable>, exts: &Externals) {
+        println!("ERASE: {:08X}", self.0.addr().get());
+        if self.header().ref_count.fetch_sub(1, Ordering::Release) != 1 {
             // Nothing else to do, forget the value
             std::mem::forget(self);
             return;
         }
 
-        let _ = self.inner().ref_count.load(Ordering::Acquire);
+        let _ = self.header().ref_count.load(Ordering::Acquire);
         unsafe {
-            println!("DROPPING: {:?}", self.0.addr());
             // SAFETY: We're the last reference to this cell
-            self.drop_inner(vtable);
+            self.erase_inner(vtable, exts);
         }
     }
+}
+
+impl Tracked for SharedCell {
+    unsafe fn erase_in_place(&mut self, exts: &Externals) {}
 }
 
 #[cfg(debug_assertions)]
@@ -225,13 +367,17 @@ pub struct ExtTyDesc {
     flags: ExtTyFlags,
     index: usize,
     id: TypeId,
-    vtable: DynMetadata<dyn Sync>,
+    vtable: DynMetadata<dyn ExtVTable>,
 }
 
 impl ExtTyDesc {
-    fn new<T: Sync + 'static>(name: impl ToString, flags: ExtTyFlags, index: usize) -> ExtTyDesc {
-        let t_ptr = std::ptr::dangling::<CellInner<T>>();
-        let dyn_ptr: *const dyn Sync = t_ptr;
+    fn new<T: 'static + ?Sized + Pointee + Tracked>(
+        name: impl ToString,
+        flags: ExtTyFlags,
+        index: usize,
+    ) -> ExtTyDesc {
+        let t_ptr: *const UniqueCell<T> = std::ptr::dangling();
+        let dyn_ptr: *const dyn ExtVTable = t_ptr;
         ExtTyDesc {
             name: name.to_string(),
             flags,
@@ -245,10 +391,19 @@ impl ExtTyDesc {
 #[repr(transparent)]
 pub struct ExtVal<'h>(*mut (), PhantomData<&'h ()>);
 
+// SAFETY: ExtVal is effective a enum { Imm(u32), Cell(SharedCell) }
+//         And SharedCell is effectively an Arc (which are all sync)
+//         So ExtVal should be Sync too
+unsafe impl<'h> Sync for ExtVal<'h> {}
+
 impl<'h> ExtVal<'h> {
     const VAL_SHIFT: usize = 3;
     const TY_SHIFT: usize = 48;
     const VAL_MASK: usize = (1 << Self::TY_SHIFT) - 1;
+
+    pub fn nil() -> ExtVal<'static> {
+        ExtVal(std::ptr::null_mut(), PhantomData)
+    }
 
     pub(crate) unsafe fn addr(&self) -> *mut () {
         self.0.map_addr(|x| x & Self::VAL_MASK)
@@ -305,6 +460,22 @@ impl<'h> ExtVal<'h> {
         unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
     }
 
+    pub fn arr_from<T: 'h, const N: usize>(ty: ExtTy, vals: [T; N]) -> ExtVal<'h> {
+        debug_assert!(ty.is_cell());
+        let cell = UniqueCell::from_array(vals);
+        // SAFETY: See `cell()`
+        let ptr = unsafe { cell.into_shared().to_ptr() };
+        unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
+    }
+
+    pub fn arr<T: 'h>(ty: ExtTy, n: usize, f: impl FnMut() -> T) -> ExtVal<'h> {
+        debug_assert!(ty.is_cell());
+        let cell = UniqueCell::new_array(n, f);
+        // SAFETY: See `cell()`
+        let ptr = unsafe { cell.into_shared().to_ptr() };
+        unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
+    }
+
     fn get_imm<T: From<u32>>(&self) -> T {
         debug_assert!(self.ty().is_imm());
         // SAFETY: It's safe to call addr() because immediates
@@ -335,14 +506,10 @@ impl<'h> ExtVal<'h> {
         }
     }
 
-    pub fn erase(self, exts: &Externals) {
-        let ty = self.ty();
-        if ty.is_cell() {
-            let c = unsafe { self.get_cell_ptr() };
-            // We've transfered ownership to `c`, so forget self
-            std::mem::forget(self);
-            c.erase(exts.type_desc_of(ty).vtable)
-        }
+    pub fn erase(mut self, exts: &Externals) {
+        // SAFETY: Because we're forgetting self afterwards, it's safe to erase in place
+        unsafe { self.erase_in_place(exts) }
+        std::mem::forget(self);
     }
 
     pub fn is_truthy(&self) -> bool {
@@ -394,6 +561,16 @@ impl<'h> fmt::Debug for ExtVal<'h> {
     }
 }
 
+impl<'h> Tracked for ExtVal<'h> {
+    unsafe fn erase_in_place(&mut self, exts: &Externals) {
+        let ty = self.ty();
+        if ty.is_cell() {
+            let c = unsafe { self.get_cell_ptr() };
+            c.erase(exts.type_desc_of(ty).vtable, exts)
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 impl<'h> Drop for ExtVal<'h> {
     fn drop(&mut self) {
@@ -414,6 +591,10 @@ pub struct IoHandle {
     pub op_count: AtomicUsize,
 }
 
+impl Tracked for IoHandle {
+    unsafe fn erase_in_place(&mut self, _exts: &Externals) {}
+}
+
 impl Externals {
     pub const SEQ: u16 = 0;
     pub const ADD: u16 = 1;
@@ -422,6 +603,7 @@ impl Externals {
     pub const NIL_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::empty(), 0) };
     pub const I32_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::empty(), 1) };
     pub const IO_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::CELL, 2) };
+    pub const ARR_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::CELL, 3) };
 
     pub fn builtins() -> Externals {
         Externals {
@@ -440,11 +622,25 @@ impl Externals {
                     rt.erase(x);
                     io
                 },
+                |rt, len, v| {
+                    assert_eq!(len.ty(), Self::I32_TY);
+                    let arr = if v.ty() == Self::NIL_TY {
+                        // Fast path for nil, no need to go through dup
+                        ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || {
+                            ExtVal::nil()
+                        })
+                    } else {
+                        ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || v.dup())
+                    };
+                    rt.erase(v);
+                    arr
+                },
             ],
             ty_descs: vec![
                 ExtTyDesc::new::<u32>("nil", ExtTyFlags::empty(), 0),
                 ExtTyDesc::new::<i32>("i32", ExtTyFlags::empty(), 1),
                 ExtTyDesc::new::<IoHandle>("io", ExtTyFlags::CELL, 2),
+                ExtTyDesc::new::<[ExtVal]>("arr", ExtTyFlags::CELL, 3),
             ],
         }
     }
