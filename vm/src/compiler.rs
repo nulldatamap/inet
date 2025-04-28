@@ -355,7 +355,7 @@ impl Compiler {
             Add(e0, e1) => {
                 let a = self.gen_expr(*e0)?;
                 let b = self.gen_expr(*e1)?;
-                self.extcall(Externals::ADD, a, b, r);
+                self.extcall(Externals::I32_ADD, a, b, r);
             }
             Call(f, mut es) => {
                 if es.is_empty() {

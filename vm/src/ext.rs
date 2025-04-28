@@ -50,6 +50,12 @@ impl<'h> Tracked for [ExtVal<'h>] {
 trait ExtVTable: Tracked {}
 impl<T: ?Sized + Tracked> ExtVTable for UniqueCell<T> {}
 
+#[repr(C)]
+struct Payload<H, T> {
+    head: H,
+    tail: [T],
+}
+
 macro_rules! prim_tracked {
     ($($ty:ty),*) => { $(impl Tracked for $ty { unsafe fn erase_in_place(&mut self, _exts: &Externals) {} })* }
 }
@@ -90,6 +96,7 @@ impl<T: ?Sized> UniqueCell<T> {
             std::ptr::from_raw_parts::<CellInner<T>>(self.0.as_ptr(), (*self.0.as_ptr()).metadata)
         }
     }
+
     fn recover_layout(&self) -> Layout {
         // SAFETY: Due to constraints of unsized UniqueCell, this show always be valid:
         unsafe { Layout::for_value_raw::<CellInner<T>>(self.cell_ptr()) }
@@ -107,6 +114,54 @@ impl<T: ?Sized> UniqueCell<T> {
     }
 }
 
+impl<H, T> UniqueCell<Payload<H, T>> {
+    fn payload_layout(n: usize) -> (Layout, usize) {
+        let (l, off) = Layout::new::<CellHeader<<Payload<H, T> as Pointee>::Metadata>>()
+            .extend(Layout::new::<H>())
+            .unwrap()
+            .0
+            .extend(Layout::array::<T>(n).unwrap())
+            .unwrap();
+        (l.pad_to_align(), off)
+    }
+
+    fn new_array_like(v: H, n: usize, mut f: impl FnMut() -> T) -> Self {
+        let (layout, elms_off) = Self::payload_layout(n);
+        // SAFETY: See `UniqueCell::new`
+        let ptr: *mut CellInner<[T; 0]> = unsafe { std::alloc::alloc(layout) }.cast();
+        // SAFETY: The header field should be valid from the alloc
+        unsafe {
+            (&raw mut (*ptr).header)
+                .cast::<CellHeader<<[T] as Pointee>::Metadata>>()
+                .write(CellHeader {
+                    ref_count: AtomicUsize::new(1),
+                    metadata: n,
+                });
+        };
+        // Initialize the data
+        // SAFETY: ptr comes from a valid alloc
+        let head = (&raw mut (unsafe { &mut *ptr }).payload).cast::<H>();
+        // SAFETY: Head should correspond to the valid payload.head field
+        unsafe { head.write(v) };
+
+        // SAFETY: elms_off comes from payload_layout and should correspond
+        //         To the payload.tail offset
+        let data = unsafe { ptr.byte_offset(elms_off as isize).cast::<T>() };
+        for i in 0..(n as isize) {
+            unsafe { data.offset(i).write(f()) };
+        }
+
+        // SAFETY: Can't be null
+        let u = UniqueCell::<Payload<H, T>>(
+            unsafe { NonNull::new_unchecked(&raw mut *ptr).cast() },
+            PhantomData,
+        );
+
+        debug_assert_eq!(layout, u.recover_layout());
+        u
+    }
+}
+
 impl<T> UniqueCell<[T]> {
     fn array_layout(n: usize) -> Layout {
         Layout::new::<CellHeader<<[T] as Pointee>::Metadata>>()
@@ -114,35 +169,6 @@ impl<T> UniqueCell<[T]> {
             .unwrap()
             .0
             .pad_to_align()
-    }
-
-    fn from_array<U: Unsize<[T]>>(data: U) -> Self {
-        // SAFETY: See `UniqueCell::new`
-        let n = {
-            let data: &[T] = &data;
-            data.len()
-        };
-        let ptr: *mut CellInner<U> = unsafe { std::alloc::alloc(Self::array_layout(n)) }.cast();
-        // SAFETY: See `UniqueCell::new`
-        unsafe {
-            ptr.write(CellInner {
-                header: CellHeader {
-                    ref_count: AtomicUsize::new(1),
-                    // NOTE: We're going from U (Sized) to T (Unsized)
-                    metadata: metadata(&(*ptr).payload),
-                },
-                payload: data,
-            });
-        }
-        // SAFETY: Can't be null
-        let u = UniqueCell::<[T]>(
-            unsafe { NonNull::new_unchecked(&raw mut *ptr).cast() },
-            PhantomData,
-        );
-
-        debug_assert_eq!(UniqueCell::<U>::layout(), u.recover_layout());
-        debug_assert_eq!(UniqueCell::<U>::layout(), Self::array_layout(n));
-        u
     }
 
     fn new_array(n: usize, mut f: impl FnMut() -> T) -> Self {
@@ -225,7 +251,7 @@ struct SharedCell(NonNull<CellHeader<()>>);
 
 impl SharedCell {
     // SAFETY: `self` must have come from a matching Cell<T>::into_untyped
-    unsafe fn into_unique<T>(self) -> UniqueCell<T> {
+    unsafe fn into_unique<T: ?Sized>(self) -> UniqueCell<T> {
         if self.header().ref_count.load(Ordering::Acquire) != 1 {
             panic!("Trying to turn a SharedCell into a UniqueOnce, but there's still other references to it");
         }
@@ -255,12 +281,46 @@ impl SharedCell {
     }
 
     // SAFETY: The cell's contents must be of type T and the lifetime must be valid
-    unsafe fn as_ref<'a, T>(&self) -> &'a T {
+    unsafe fn as_ref<'a, T: ?Sized>(&self) -> &'a T {
         // SAFETY: Because we have a &Cell then there's at least
         //         One reference keeping the inner cell alive
         //         So it's safe to create a ref to the payload
-        let inner: &CellInner<T> = unsafe { self.0.cast().as_ref() };
+        let inner = unsafe {
+            std::ptr::from_raw_parts::<CellInner<T>>(
+                self.0.as_ptr(),
+                (*self
+                    .0
+                    .as_ptr()
+                    .cast::<CellHeader<<T as Pointee>::Metadata>>())
+                .metadata,
+            )
+            .as_ref_unchecked()
+        };
         &inner.payload
+    }
+
+    // SAFETY: The cell's contents must be of type T and the lifetime must be valid
+    unsafe fn as_mut<'a, T: ?Sized>(&mut self) -> Option<&'a mut T> {
+        // It's only safe to get a mutable reference if the ref-count is one,
+        // i.e. there's no way other than this currently SharedCell to access the inner value
+        if self.header().ref_count.load(Ordering::Acquire) != 1 {
+            return None;
+        }
+
+        // SAFETY: See `as_ref`
+        let inner = unsafe {
+            std::ptr::from_raw_parts_mut::<CellInner<T>>(
+                self.0.as_ptr(),
+                (*self
+                    .0
+                    .as_ptr()
+                    .cast::<CellHeader<<T as Pointee>::Metadata>>())
+                .metadata,
+            )
+            .as_mut_unchecked()
+        };
+
+        Some(&mut inner.payload)
     }
 
     fn dup(&self) -> SharedCell {
@@ -371,7 +431,7 @@ pub struct ExtTyDesc {
 }
 
 impl ExtTyDesc {
-    fn new<T: 'static + ?Sized + Pointee + Tracked>(
+    fn new<T: ?Sized + Pointee + Tracked + 'static>(
         name: impl ToString,
         flags: ExtTyFlags,
         index: usize,
@@ -382,7 +442,7 @@ impl ExtTyDesc {
             name: name.to_string(),
             flags,
             index,
-            id: TypeId::of::<T>(),
+            id: typeid::of::<T>(),
             vtable: std::ptr::metadata(dyn_ptr),
         }
     }
@@ -460,17 +520,17 @@ impl<'h> ExtVal<'h> {
         unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
     }
 
-    pub fn arr_from<T: 'h, const N: usize>(ty: ExtTy, vals: [T; N]) -> ExtVal<'h> {
+    pub fn arr<T: 'h>(ty: ExtTy, n: usize, f: impl FnMut() -> T) -> ExtVal<'h> {
         debug_assert!(ty.is_cell());
-        let cell = UniqueCell::from_array(vals);
+        let cell = UniqueCell::new_array(n, f);
         // SAFETY: See `cell()`
         let ptr = unsafe { cell.into_shared().to_ptr() };
         unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
     }
 
-    pub fn arr<T: 'h>(ty: ExtTy, n: usize, f: impl FnMut() -> T) -> ExtVal<'h> {
+    pub fn arr_like<H: 'h, T: 'h>(ty: ExtTy, h: H, n: usize, f: impl FnMut() -> T) -> ExtVal<'h> {
         debug_assert!(ty.is_cell());
-        let cell = UniqueCell::new_array(n, f);
+        let cell = UniqueCell::new_array_like(h, n, f);
         // SAFETY: See `cell()`
         let ptr = unsafe { cell.into_shared().to_ptr() };
         unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
@@ -524,8 +584,9 @@ impl<'h> ExtVal<'h> {
     pub fn get_i32(&self) -> i32 {
         self.get_imm::<u32>() as i32
     }
+
     // SAFETY: The type stored in the cell must be T
-    pub(crate) unsafe fn get_ref_unchecked<T: Sync>(&self) -> &T {
+    pub(crate) unsafe fn get_ref_unchecked<T: Sync + ?Sized>(&self) -> &T {
         debug_assert!(self.ty().is_cell());
         // SAFETY: The lifetime is bound to the extval
         let p = self.get_cell_ptr();
@@ -536,7 +597,18 @@ impl<'h> ExtVal<'h> {
     }
 
     // SAFETY: The type stored in the cell must be T
-    pub(crate) unsafe fn get_unique_unchecked<T: Sync>(self) -> UniqueCell<T> {
+    pub(crate) unsafe fn get_mut_unchecked<T: Sync + ?Sized>(&mut self) -> Option<&mut T> {
+        debug_assert!(self.ty().is_cell());
+        // SAFETY: The lifetime is bound to the extval
+        let mut p = self.get_cell_ptr();
+        let r = p.as_mut();
+        // `p` is still owned because of &self, so don't drop it
+        std::mem::forget(p);
+        r
+    }
+
+    // SAFETY: The type stored in the cell must be T
+    pub(crate) unsafe fn get_unique_unchecked<T: Sync + ?Sized>(self) -> UniqueCell<T> {
         debug_assert!(self.ty().is_cell());
         // SAFETY: The lifetime is bound to the extval
         let p = self.get_cell_ptr();
@@ -595,52 +667,185 @@ impl Tracked for IoHandle {
     unsafe fn erase_in_place(&mut self, _exts: &Externals) {}
 }
 
-impl Externals {
-    pub const SEQ: u16 = 0;
-    pub const ADD: u16 = 1;
-    pub const PRINT: u16 = 2;
+struct ArgsHeader {
+    builtin: usize,
+    index: usize,
+}
 
+#[repr(transparent)]
+pub struct Args<'h> {
+    payload: Payload<ArgsHeader, ExtVal<'h>>,
+}
+
+impl<'h> Args<'h> {
+    fn builtin(&mut self) -> usize {
+        self.payload.head.builtin
+    }
+
+    fn len(&mut self) -> usize {
+        self.payload.tail.len()
+    }
+
+    fn is_ready(&mut self) -> bool {
+        self.payload.head.index == (&self.payload.tail).len()
+    }
+
+    fn push(&mut self, v: ExtVal<'h>) {
+        let old_v = std::mem::replace(&mut self.payload.tail[self.payload.head.index], v);
+        // `old_v` should never be cell value, so it's fine top drop it instead of `erase`'ing it
+        debug_assert_eq!(old_v.ty(), Externals::NIL_TY);
+        self.payload.head.index += 1;
+    }
+
+    fn pop(&mut self) -> ExtVal<'h> {
+        assert!(self.payload.head.index > 0);
+        self.payload.head.index -= 1;
+        std::mem::replace(
+            &mut self.payload.tail[self.payload.head.index],
+            ExtVal::nil(),
+        )
+    }
+}
+
+impl<'h> From<&Payload<ArgsHeader, ExtVal<'h>>> for &Args<'h> {
+    fn from(value: &Payload<ArgsHeader, ExtVal<'h>>) -> Self {
+        // SAFETY: repr(transparent)
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+impl<'h> From<&mut Payload<ArgsHeader, ExtVal<'h>>> for &mut Args<'h> {
+    fn from(value: &mut Payload<ArgsHeader, ExtVal<'h>>) -> Self {
+        // SAFETY: repr(transparent)
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+impl<'h> Tracked for Args<'h> {
+    unsafe fn erase_in_place(&mut self, exts: &Externals) {
+        for v in self.payload.tail.iter_mut() {
+            v.erase_in_place(exts);
+        }
+    }
+}
+
+impl Externals {
     pub const NIL_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::empty(), 0) };
     pub const I32_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::empty(), 1) };
     pub const IO_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::CELL, 2) };
     pub const ARR_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::CELL, 3) };
+    pub const ARGS_TY: ExtTy = unsafe { ExtTy::new(ExtTyFlags::CELL, 4) };
+
+    pub const SEQ: u16 = 0;
+    pub const I32_ADD: u16 = 1;
+    pub const PRINT: u16 = 2;
+    pub const MK_ARR: u16 = 3;
+    pub const ARR_GET: u16 = 4;
+    pub const MK_ARGS: u16 = 5;
+    pub const ARGS_PUSH: u16 = 6;
+    pub const ARR_SET: u16 = 7;
 
     pub fn builtins() -> Externals {
-        Externals {
-            extfns: vec![
-                |_rt, l, _r| l,
-                |_rt, l, r| {
+        const args_err: &'static str =
+            "Mutliple references exist to Args value, Args should always be unique";
+        let mut fs = Vec::<ExtFnF>::new();
+
+        macro_rules! extfns {
+            ($($id:ident : |$rt:pat_param, $l:pat_param, $r:pat_param| $x:block),+) => {
+                $(assert_eq!(fs.len(), Self::$id as usize);
+                fs.push(|$rt, $l, $r| $x);)+
+            }
+        }
+
+        extfns!(
+            SEQ: |_rt, l, _r| { l },
+            I32_ADD: |_rt, l, r| {
                     assert_eq!(l.ty(), Self::I32_TY);
                     assert_eq!(r.ty(), Self::I32_TY);
                     ExtVal::i32(l.get_i32() + r.get_i32())
-                },
-                |rt, io, x| {
-                    assert_eq!(io.ty(), Self::IO_TY);
-                    println!("{:?}", x);
-                    let io_handle = rt.get_cell::<IoHandle>(&io);
-                    io_handle.op_count.fetch_add(1, Ordering::Relaxed);
-                    rt.erase(x);
-                    io
-                },
-                |rt, len, v| {
-                    assert_eq!(len.ty(), Self::I32_TY);
-                    let arr = if v.ty() == Self::NIL_TY {
-                        // Fast path for nil, no need to go through dup
-                        ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || {
-                            ExtVal::nil()
-                        })
-                    } else {
-                        ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || v.dup())
-                    };
-                    rt.erase(v);
-                    arr
-                },
-            ],
+            },
+            PRINT: |rt, io, x| {
+                assert_eq!(io.ty(), Self::IO_TY);
+                println!("{:?}", x);
+                let io_handle = rt.get_cell::<IoHandle>(&io);
+                io_handle.op_count.fetch_add(1, Ordering::Relaxed);
+                rt.erase(x);
+                io
+            },
+            MK_ARR: |rt, len, v| {
+                assert_eq!(len.ty(), Self::I32_TY);
+                let arr = if v.ty() == Self::NIL_TY {
+                    // Fast path for nil, no need to go through dup
+                    ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || {
+                        ExtVal::nil()
+                    })
+                } else {
+                    ExtVal::arr(Self::ARR_TY, len.get_imm::<u32>() as usize, || v.dup())
+                };
+                rt.erase(v);
+                arr
+            },
+            ARR_GET: |rt, xs, i| {
+                assert_eq!(xs.ty(), Self::ARR_TY);
+                assert_eq!(i.ty(), Self::I32_TY);
+                let v = rt.get_cell::<[ExtVal]>(&xs);
+                let r = v[i.get_imm::<u32>() as usize].dup();
+                rt.erase(xs);
+                r
+            },
+            MK_ARGS: |rt, f, len| {
+                assert_eq!(f.ty(), Self::I32_TY);
+                assert_eq!(len.ty(), Self::I32_TY);
+                let n = len.get_imm::<u32>() as usize;
+                let args = ExtVal::arr_like(
+                    Self::ARGS_TY,
+                    ArgsHeader {
+                        builtin: f.get_imm::<u32>() as usize,
+                        index: 0,
+                    },
+                    n,
+                    || ExtVal::nil(),
+                );
+                rt.erase(f);
+                rt.erase(len);
+                args
+            },
+            ARGS_PUSH: |rt, mut args, x| {
+                assert_eq!(args.ty(), Self::ARGS_TY);
+                let (f, ready) = {
+                    let args = rt.get_cell_mut::<Args>(&mut args).expect(args_err);
+                    (args.builtin(), args.is_ready())
+                };
+                if ready {
+                    rt.invoke_builtin(f, args, x, false)
+                } else {
+                    rt.get_cell_mut::<Args>(&mut args).expect(args_err).push(x);
+                    args
+                }
+            },
+            ARR_SET: |rt, mut xs_i, v| {
+                assert_eq!(xs_i.ty(), Self::ARR_TY);
+                let args = rt.get_cell_mut::<Args>(&mut xs_i).expect(args_err);
+                assert_eq!(args.len(), 2);
+                let i = args.pop();
+                assert_eq!(i.ty(), Self::I32_TY);
+                let mut xs = args.pop();
+                assert_eq!(xs.ty(), Self::ARR_TY);
+                { let xs = rt.get_cell_mut::<[ExtVal]>(&mut xs).expect("Can't modify array, more than one reference exists!");
+                rt.erase(std::mem::replace(&mut xs[i.get_imm::<u32>() as usize], v)); }
+                xs
+            }
+
+        );
+
+        Externals {
+            extfns: fs,
             ty_descs: vec![
                 ExtTyDesc::new::<u32>("nil", ExtTyFlags::empty(), 0),
                 ExtTyDesc::new::<i32>("i32", ExtTyFlags::empty(), 1),
                 ExtTyDesc::new::<IoHandle>("io", ExtTyFlags::CELL, 2),
                 ExtTyDesc::new::<[ExtVal]>("arr", ExtTyFlags::CELL, 3),
+                ExtTyDesc::new::<Args>("args", ExtTyFlags::CELL, 4),
             ],
         }
     }
@@ -651,7 +856,7 @@ impl Externals {
         desc
     }
 
-    pub fn is_type<T: Sync + 'static>(&self, ty: ExtTy) -> bool {
-        self.ty_descs[ty.index()].id == TypeId::of::<T>()
+    pub fn is_type<T: Sync + ?Sized>(&self, ty: ExtTy) -> bool {
+        self.ty_descs[ty.index()].id == typeid::of::<T>()
     }
 }

@@ -1,4 +1,11 @@
-#![feature(thin_box, ptr_metadata, ptr_as_ref_unchecked, non_null_from_ref, unsize, layout_for_ptr)]
+#![feature(
+    thin_box,
+    ptr_metadata,
+    ptr_as_ref_unchecked,
+    non_null_from_ref,
+    unsize,
+    layout_for_ptr
+)]
 mod compiler;
 mod ext;
 mod heap;
@@ -24,8 +31,34 @@ fn main() {
             "main",
             lam(
                 vec!["io"],
-                letv("x", extcall(3, i(1), extcall(3, i(3), i(1))),
-                print(print(v("io"), v("x")), v("x"))),
+                letv(
+                    "x",
+                    extcall(Externals::MK_ARR, i(3), i(0)),
+                    print(
+                        v("io"),
+                        extcall(
+                            Externals::ARR_GET,
+                            extcall(
+                                Externals::ARGS_PUSH,
+                                extcall(
+                                    Externals::ARGS_PUSH,
+                                    extcall(
+                                        Externals::ARGS_PUSH,
+                                        extcall(
+                                            Externals::MK_ARGS,
+                                            i(Externals::ARR_SET as i32),
+                                            i(2),
+                                        ),
+                                        v("x"),
+                                    ),
+                                    i(1),
+                                ),
+                                i(99),
+                            ),
+                            i(1),
+                        ),
+                    ),
+                ),
             ),
         ),
         def("three", lam(vec![], i(3))),

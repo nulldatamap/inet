@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 bitflags = "2.9.0"
+typeid = "1.0.3"

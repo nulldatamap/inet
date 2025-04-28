@@ -170,8 +170,7 @@ impl<'h> Rt<'h> {
             if y_val.tag() == Tag::ExtVal {
                 self.allocator.free_wire(y);
                 let (flipped, idx) = f.extfn_label().get();
-                let (a, b) = if flipped { (y_val, x) } else { (x, y_val) };
-                let r = self.externals.extfns[idx](self, a.to_extval(), b.to_extval());
+                let r = self.invoke_builtin(idx, x.to_extval(), y_val.to_extval(), flipped);
                 self.link_wire(res, Port::from_extval(r));
                 return;
             }
@@ -216,13 +215,24 @@ impl<'h> Rt<'h> {
         debug_assert!(self.registers.iter().all(|r| r.is_none()));
     }
 
-    pub fn get_cell<'a, T: Sync + 'static>(&self, v: &'a ExtVal<'h>) -> &'a T {
+    pub fn invoke_builtin(&mut self, f: usize, x: ExtVal<'h>, y: ExtVal<'h>, flipped: bool) -> ExtVal<'h> {
+        let (a, b) = if flipped { (y, x) } else { (x, y) };
+        self.externals.extfns[f](self, a, b)
+    }
+
+    pub fn get_cell<'a, T: Sync + 'static + ?Sized>(&self, v: &'a ExtVal<'h>) -> &'a T {
         debug_assert!(self.externals.is_type::<T>(v.ty()));
         // SAFETY: We've validated the TypeId of T
         unsafe { v.get_ref_unchecked() }
     }
 
-    pub fn get_unique<T: Sync + 'static>(&self, v: ExtVal<'h>) -> UniqueCell<T> {
+    pub fn get_cell_mut<'a, T: Sync + ?Sized>(&self, v: &'a mut ExtVal<'h>) -> Option<&'a mut T> {
+        debug_assert!(self.externals.is_type::<T>(v.ty()));
+        // SAFETY: We've validated the TypeId of T
+        unsafe { v.get_mut_unchecked() }
+    }
+
+    pub fn get_unique<T: Sync + 'static + ?Sized>(&self, v: ExtVal<'h>) -> UniqueCell<T> {
         debug_assert!(self.externals.is_type::<T>(v.ty()));
         // SAFETY: We've validated the TypeId of T
         unsafe { v.get_unique_unchecked() }
