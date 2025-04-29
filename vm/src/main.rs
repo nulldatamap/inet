@@ -33,29 +33,12 @@ fn main() {
                 vec!["io"],
                 letv(
                     "x",
-                    extcall(Externals::MK_ARR, i(3), i(0)),
+                    extcall(Externals::MK_ARR, vec![i(3), i(0)]),
                     print(
                         v("io"),
                         extcall(
                             Externals::ARR_GET,
-                            extcall(
-                                Externals::ARGS_PUSH,
-                                extcall(
-                                    Externals::ARGS_PUSH,
-                                    extcall(
-                                        Externals::ARGS_PUSH,
-                                        extcall(
-                                            Externals::MK_ARGS,
-                                            i(Externals::ARR_SET as i32),
-                                            i(2),
-                                        ),
-                                        v("x"),
-                                    ),
-                                    i(1),
-                                ),
-                                i(99),
-                            ),
-                            i(1),
+                            vec![extcall(Externals::ARR_SET, vec![v("x"), i(1), i(99)]), i(1)],
                         ),
                     ),
                 ),

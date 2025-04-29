@@ -23,7 +23,7 @@ pub enum Expr {
     Lam(Vec<String>, Box<Expr>),
     Tup(Vec<Expr>),
     Untup(Vec<String>, Box<Expr>, Box<Expr>),
-    ExtCall(u16, Box<Expr>, Box<Expr>),
+    ExtCall(u16, Vec<Expr>),
     Lift(Box<Expr>),
     Lower(Box<Expr>),
 }
@@ -37,11 +37,11 @@ pub fn v(x: &'static str) -> Expr {
 pub fn letv(x: &'static str, v: Expr, b: Expr) -> Expr {
     Expr::Let(x.to_string(), Box::new(v), Box::new(b))
 }
-pub fn extcall(lbl: u16, a: Expr, b: Expr) -> Expr {
-    Expr::ExtCall(lbl, Box::new(a), Box::new(b))
+pub fn extcall(lbl: u16, xs: Vec<Expr>) -> Expr {
+    Expr::ExtCall(lbl, xs)
 }
 pub fn print(a: Expr, b: Expr) -> Expr {
-    Expr::ExtCall(Externals::PRINT, Box::new(a), Box::new(b))
+    Expr::ExtCall(Externals::PRINT, vec![a, b])
 }
 pub fn lam(xs: Vec<&'static str>, b: Expr) -> Expr {
     Expr::Lam(xs.iter().map(|x| x.to_string()).collect(), Box::new(b))
@@ -185,9 +185,26 @@ impl Compiler {
         r
     }
 
+    fn nil(&mut self, r: Reg) {
+        self.insts
+            .push(UInst::Nilary(r, Port::from_extval(ExtVal::nil())));
+    }
+
+    fn gen_nil(&mut self) -> Reg {
+        let r = self.gen();
+        self.nil(r);
+        r
+    }
+
     fn val(&mut self, r: Reg, x: i32) {
         self.insts
             .push(UInst::Nilary(r, Port::from_extval(ExtVal::i32(x))));
+    }
+
+    fn gen_val(&mut self, x: i32) -> Reg {
+        let r = self.gen();
+        self.val(r, x);
+        r
     }
 
     fn erase(&mut self, r: Reg) {
@@ -347,10 +364,39 @@ impl Compiler {
                 let var_reg = self.materialize_users(user)?;
                 self.expr(*v, var_reg)?;
             }
-            ExtCall(extfn, e0, e1) => {
-                let a = self.gen_expr(*e0)?;
-                let b = self.gen_expr(*e1)?;
-                self.extcall(extfn, a, b, r);
+            ExtCall(extfn, es) => {
+                if es.len() <= 2 {
+                    // Pass in the arguments directly
+                    let mut es = es.into_iter();
+                    let a = if let Some(e) = es.next() {
+                        self.gen_expr(e)?
+                    } else {
+                        self.gen_nil()
+                    };
+                    let b = if let Some(e) = es.next() {
+                        self.gen_expr(e)?
+                    } else {
+                        self.gen_nil()
+                    };
+                    self.extcall(extfn, a, b, r);
+                } else {
+                    // Make an arg value
+                    let args = self.gen();
+                    let rf = self.gen_val(extfn as i32);
+                    let rn = self.gen_val(es.len() as i32 - 1);
+                    self.extcall(Externals::MK_ARGS, rf, rn, args);
+                    let mut es = es.into_iter();
+                    let first = es.next().unwrap();
+                    // r = push_arg(push_arg(push_arg(args x0) x1) x2)
+                    let from = es.try_rfold(r, |to, e| -> Result<Reg> {
+                        let from = self.gen();
+                        let x = self.gen_expr(e)?;
+                        self.extcall(Externals::ARGS_PUSH, from, x, to);
+                        Ok(from)
+                    })?;
+                    let x = self.gen_expr(first)?;
+                    self.extcall(Externals::ARGS_PUSH, args, x, from);
+                }
             }
             Add(e0, e1) => {
                 let a = self.gen_expr(*e0)?;

@@ -824,13 +824,14 @@ impl Externals {
                 }
             },
             ARR_SET: |rt, mut xs_i, v| {
-                assert_eq!(xs_i.ty(), Self::ARR_TY);
+                assert_eq!(xs_i.ty(), Self::ARGS_TY);
                 let args = rt.get_cell_mut::<Args>(&mut xs_i).expect(args_err);
                 assert_eq!(args.len(), 2);
                 let i = args.pop();
                 assert_eq!(i.ty(), Self::I32_TY);
                 let mut xs = args.pop();
                 assert_eq!(xs.ty(), Self::ARR_TY);
+                rt.erase(xs_i);
                 { let xs = rt.get_cell_mut::<[ExtVal]>(&mut xs).expect("Can't modify array, more than one reference exists!");
                 rt.erase(std::mem::replace(&mut xs[i.get_imm::<u32>() as usize], v)); }
                 xs
