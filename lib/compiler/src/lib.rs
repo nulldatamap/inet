@@ -3,12 +3,13 @@ use std::{
     num::NonZeroUsize,
 };
 
-use crate::{
+use vm::{
     ext::{ExtVal, Externals},
     program::*,
-    repr::{CombLabel, OperatorLabel, Tag},
-    Port,
+    repr::{CombLabel, OperatorLabel, Tag, Port},
 };
+
+pub mod parser;
 
 type UInst = UnlinkedInst;
 

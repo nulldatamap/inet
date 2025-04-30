@@ -6,22 +6,15 @@
     unsize,
     layout_for_ptr
 )]
-mod compiler;
-mod ext;
-mod heap;
-mod program;
-mod repr;
-mod rt;
-
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use compiler::*;
-use ext::*;
-use heap::*;
-use program::*;
-use repr::*;
-use rt::*;
+use vm::ext::*;
+use vm::heap::*;
+use vm::program::*;
+use vm::repr::*;
+use vm::rt::*;
 
 fn main() {
     let h = Heap::new(NonZeroUsize::new(4096).unwrap());

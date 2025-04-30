@@ -23,8 +23,9 @@ pub struct Rt<'h> {
     pub(crate) allocator: Allocator<'h>,
     pub(crate) externals: Externals,
 
-    pub(crate) active_fast: Vec<(Port<'h>, Port<'h>)>,
-    pub(crate) active_slow: Vec<(Port<'h>, Port<'h>)>,
+    // TODO: Hide these later
+    pub active_fast: Vec<(Port<'h>, Port<'h>)>,
+    pub active_slow: Vec<(Port<'h>, Port<'h>)>,
 
     registers: Vec<Option<Port<'h>>>,
 }
@@ -87,7 +88,8 @@ impl<'h> Rt<'h> {
         }
     }
 
-    pub(crate) fn interact(&mut self, a: Port<'h>, b: Port<'h>) {
+    // TODO: Hide this later
+    pub fn interact(&mut self, a: Port<'h>, b: Port<'h>) {
         use Tag::*;
 
         match ((a.tag(), a), (b.tag(), b)) {

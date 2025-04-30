@@ -1,0 +1,8 @@
+[package]
+name = "inet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vm = { path = "./lib/vm" }
+compiler = { path = "./lib/compiler" }
