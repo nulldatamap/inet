@@ -3,6 +3,9 @@ name = "inet"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["lib/compiler", "lib/vm"]
+
 [dependencies]
 vm = { path = "./lib/vm" }
 compiler = { path = "./lib/compiler" }
