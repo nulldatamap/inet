@@ -9,7 +9,7 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use compiler::*;
+use compiler::lowering::*;
 use vm::ext::*;
 use vm::heap::*;
 use vm::program::*;
@@ -19,7 +19,7 @@ use vm::rt::*;
 fn main() {
     let h = Heap::new(NonZeroUsize::new(4096).unwrap());
     let mut rt = Rt::new(&h, Externals::builtins());
-    let uprog = Compiler::compile(vec![
+    let uprog = LowerSt::lower(vec![
         def(
             "main",
             lam(
