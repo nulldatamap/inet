@@ -61,7 +61,7 @@ impl fmt::Display for SExp {
 }
 
 fn is_ident_sym(c: char) -> bool {
-    "!#$%^&*_+-=/<>?".contains(c)
+    "@!#$%^&*_+-=/<>?".contains(c)
 }
 
 peg::parser! {

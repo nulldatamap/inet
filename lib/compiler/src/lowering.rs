@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::HashSet,
     num::NonZeroUsize,
 };
 
@@ -9,22 +9,23 @@ use vm::{
     repr::{CombLabel, OperatorLabel, Tag, Port},
 };
 
-use crate::scope::Slot;
-
+use crate::scope::Name;
 
 type UInst = UnlinkedInst;
 
-#[derive(Debug)]
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hir {
+    Nil,
     I32(i32),
-    Var(String),
+    Var(Name),
     Add(Box<Hir>, Box<Hir>),
     If(Box<Hir>, Box<Hir>, Box<Hir>),
-    Let(String, Box<Hir>, Box<Hir>),
+    Let(Name, Box<Hir>, Box<Hir>),
     Call(Box<Hir>, Vec<Hir>),
-    Lam(Vec<String>, Box<Hir>),
+    Lam(Vec<Name>, Box<Hir>),
     Tup(Vec<Hir>),
-    Untup(Vec<String>, Box<Hir>, Box<Hir>),
+    Untup(Vec<Name>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
     Lift(Box<Hir>),
     Lower(Box<Hir>),
@@ -34,10 +35,10 @@ pub fn i(i: i32) -> Hir {
     Hir::I32(i)
 }
 pub fn v(x: &'static str) -> Hir {
-    Hir::Var(x.to_string())
+    Hir::Var(Name::global(x))
 }
 pub fn letv(x: &'static str, v: Hir, b: Hir) -> Hir {
-    Hir::Let(x.to_string(), Box::new(v), Box::new(b))
+    Hir::Let(Name::global(x), Box::new(v), Box::new(b))
 }
 pub fn extcall(lbl: u16, xs: Vec<Hir>) -> Hir {
     Hir::ExtCall(lbl, xs)
@@ -46,7 +47,7 @@ pub fn print(a: Hir, b: Hir) -> Hir {
     Hir::ExtCall(Externals::PRINT, vec![a, b])
 }
 pub fn lam(xs: Vec<&'static str>, b: Hir) -> Hir {
-    Hir::Lam(xs.iter().map(|x| x.to_string()).collect(), Box::new(b))
+    Hir::Lam(xs.iter().map(|x| Name::global(x)).collect(), Box::new(b))
 }
 pub fn call(f: Hir, xs: Vec<Hir>) -> Hir {
     Hir::Call(Box::new(f), xs)
@@ -59,7 +60,7 @@ pub fn tup(es: Vec<Hir>) -> Hir {
 }
 pub fn untup(xs: Vec<&'static str>, tup: Hir, body: Hir) -> Hir {
     Hir::Untup(
-        xs.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        xs.iter().map(|x| Name::global(x)).collect::<Vec<_>>(),
         Box::new(tup),
         Box::new(body),
     )
@@ -78,13 +79,13 @@ pub struct Def {
     body: Hir,
 }
 
-type Scope = crate::scope::Scope<Vec<Reg>>;
+type Scope = crate::scope::Scope<Name, Vec<Reg>>;
 
 pub struct LowerSt {
     next_reg: NonZeroUsize,
     dup_count: u16,
-    globals: HashSet<String>,
-    globals_refs: Vec<String>,
+    globals: HashSet<Name>,
+    globals_refs: Vec<Name>,
     insts: Vec<UnlinkedInst>,
     scope: Scope,
 }
@@ -150,12 +151,12 @@ impl LowerSt {
             .expect("Too many duplicate nodes!");
     }
 
-    fn global(&mut self, r: Reg, g: &str) {
+    fn global(&mut self, r: Reg, g: &Name) {
         if let Some(g) = self.globals_refs.iter().position(|x| x == g) {
             self.insts.push(UInst::Global(r, g));
         } else {
             self.insts.push(UInst::Global(r, self.globals_refs.len()));
-            self.globals_refs.push(g.to_string());
+            self.globals_refs.push(g.clone());
         }
     }
 
@@ -201,7 +202,7 @@ impl LowerSt {
         let mut c = LowerSt::new();
 
         // Declare all the globals:
-        c.globals.extend(defs.iter().map(|d| d.name.clone()));
+        c.globals.extend(defs.iter().map(|d| Name::global(&d.name)));
 
         defs.into_iter().map(|d| c.def(d)).collect()
     }
@@ -211,7 +212,7 @@ impl LowerSt {
         self.expr(def.body, Reg::ROOT)?;
         let prog = UnlinkedProgram {
             name: def.name,
-            globals: self.globals_refs.drain(..).collect(),
+            globals: self.globals_refs.drain(..).map(Name::into_string).collect(),
             reg_count: self.next_reg.get(),
             instructions: std::mem::replace(&mut self.insts, Vec::new()),
         };
@@ -251,11 +252,11 @@ impl LowerSt {
 
     fn scoped<'a, T>(
         &'a mut self,
-        vars: &'a [String],
+        vars: &'a [Name],
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<(T, impl Iterator<Item = Vec<Reg>> + 'a)> {
         for x in vars.iter() {
-            self.scope.define(x, vec![]);
+            self.scope.define(x.clone(), vec![]);
         }
         let res = f(self)?;
         let us = vars.into_iter().map(|x| self.scope.undefine(&x));
@@ -267,10 +268,11 @@ impl LowerSt {
         println!(">> {:?} <- {:?}", r, e);
 
         match e {
+            Nil => self.nil(r),
             I32(x) => self.val(r, x),
             Var(n) => {
-                if let Some(slot) = self.scope.lookup(&n) {
-                    slot.value.push(r);
+                if let Some(users) = self.scope.lookup(&n) {
+                    users.push(r);
                 } else {
                     if self.globals.contains(&n) {
                         self.global(r, &n);

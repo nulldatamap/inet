@@ -397,15 +397,15 @@ impl ExtTy {
         f
     }
 
-    fn is_imm(self) -> bool {
+    pub fn is_imm(self) -> bool {
         !self.flags().contains(ExtTyFlags::CELL)
     }
 
-    fn is_cell(self) -> bool {
+    pub fn is_cell(self) -> bool {
         self.flags().contains(ExtTyFlags::CELL)
     }
 
-    fn index(&self) -> usize {
+    pub const fn index(&self) -> usize {
         (self.0 >> Self::SHIFT) as usize
     }
 }
@@ -423,10 +423,10 @@ impl Into<u16> for ExtTy {
 }
 
 pub struct ExtTyDesc {
-    name: String,
+    pub name: String,
     flags: ExtTyFlags,
-    index: usize,
-    id: TypeId,
+    pub index: usize,
+    pub id: TypeId,
     vtable: DynMetadata<dyn ExtVTable>,
 }
 
@@ -745,6 +745,16 @@ impl Externals {
     pub const ARGS_PUSH: u16 = 6;
     pub const ARR_SET: u16 = 7;
 
+    pub fn ext_ty_descs() -> Vec<ExtTyDesc> {
+        vec![
+            ExtTyDesc::new::<u32>("nil", ExtTyFlags::empty(), 0),
+            ExtTyDesc::new::<i32>("i32", ExtTyFlags::empty(), 1),
+            ExtTyDesc::new::<IoHandle>("io", ExtTyFlags::CELL, 2),
+            ExtTyDesc::new::<[ExtVal]>("arr", ExtTyFlags::CELL, 3),
+            ExtTyDesc::new::<Args>("args", ExtTyFlags::CELL, 4),
+        ]
+    }
+
     pub fn builtins() -> Externals {
         const args_err: &'static str =
             "Mutliple references exist to Args value, Args should always be unique";
@@ -841,13 +851,7 @@ impl Externals {
 
         Externals {
             extfns: fs,
-            ty_descs: vec![
-                ExtTyDesc::new::<u32>("nil", ExtTyFlags::empty(), 0),
-                ExtTyDesc::new::<i32>("i32", ExtTyFlags::empty(), 1),
-                ExtTyDesc::new::<IoHandle>("io", ExtTyFlags::CELL, 2),
-                ExtTyDesc::new::<[ExtVal]>("arr", ExtTyFlags::CELL, 3),
-                ExtTyDesc::new::<Args>("args", ExtTyFlags::CELL, 4),
-            ],
+            ty_descs: Externals::ext_ty_descs(),
         }
     }
 

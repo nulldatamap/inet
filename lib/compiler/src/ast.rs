@@ -4,7 +4,7 @@ use crate::reader::{Bracket, SExp};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Expr {
     Var(String),
-    Invoke(Vec<Expr>),
+    Invoke(Box<Expr>, Vec<Expr>),
     Lit(Literal),
 }
 
@@ -47,7 +47,13 @@ impl Expr {
                     todo!("empty list")
                 }
 
-                Invoke(es.iter().map(Expr::parse).collect::<Result<Vec<_>>>()?)
+                Invoke(
+                    Box::new(Expr::parse(&es[0])?),
+                    es[1..]
+                        .iter()
+                        .map(Expr::parse)
+                        .collect::<Result<Vec<_>>>()?,
+                )
             }
             List(_, es) => todo!("non-paren lists"),
             SExp::Keyword(kw) => Lit(Literal::Keyword(kw.clone())),
@@ -80,20 +86,23 @@ mod tests {
     fn test_invoke() {
         assert_eq!(
             p("(+ 1 2 3)"),
-            Ok(Invoke(vec![
-                Var("+".to_string()),
-                Lit(Num(1)),
-                Lit(Num(2)),
-                Lit(Num(3))
-            ]))
+            Ok(Invoke(
+                Box::new(Var("+".to_string())),
+                vec![Lit(Num(1)), Lit(Num(2)), Lit(Num(3))]
+            ))
         );
         assert_eq!(
             p("(+ (+ 1 2) 3)"),
-            Ok(Invoke(vec![
-                Var("+".to_string()),
-                Invoke(vec![Var("+".to_string()), Lit(Num(1)), Lit(Num(2)),]),
-                Lit(Num(3))
-            ]))
+            Ok(Invoke(
+                Box::new(Var("+".to_string())),
+                vec![
+                    Invoke(
+                        Box::new(Var("+".to_string())),
+                        vec![Lit(Num(1)), Lit(Num(2)),]
+                    ),
+                    Lit(Num(3))
+                ]
+            ))
         );
     }
 }
