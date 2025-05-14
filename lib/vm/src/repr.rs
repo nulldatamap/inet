@@ -196,6 +196,7 @@ impl fmt::Debug for OperatorLabel {
 pub enum CombLabel {
     Fn,
     Tup,
+    Ref,
     Dup(u16),
 }
 
@@ -204,9 +205,10 @@ impl Into<u16> for CombLabel {
         match self {
             CombLabel::Fn => 0,
             CombLabel::Tup => 1,
+            CombLabel::Ref => 2,
             CombLabel::Dup(v) => {
-                debug_assert!((v as usize + 2) <= u16::MAX as usize);
-                2 + v
+                debug_assert!((v as usize + 3) <= u16::MAX as usize);
+                3 + v
             }
         }
     }
@@ -217,7 +219,8 @@ impl From<u16> for CombLabel {
         match x {
             0 => CombLabel::Fn,
             1 => CombLabel::Tup,
-            _ => CombLabel::Dup(x - 2),
+            2 => CombLabel::Ref,
+            _ => CombLabel::Dup(x - 3),
         }
     }
 }
@@ -227,6 +230,7 @@ impl fmt::Debug for CombLabel {
         match self {
             CombLabel::Fn => write!(f, "fn"),
             CombLabel::Tup => write!(f, "tup"),
+            CombLabel::Ref => write!(f, "ref"),
             CombLabel::Dup(x) => write!(f, "dup{}", x),
         }
     }

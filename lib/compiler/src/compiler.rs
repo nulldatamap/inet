@@ -18,6 +18,21 @@ struct BuiltinEntry {
     arity: usize,
     ty: FnType,
     ty_id: TypeId,
+    uses_io: bool,
+}
+
+impl BuiltinEntry {
+    fn new(name: String, id: u16, fty: FnType, tid: TypeId) -> BuiltinEntry {
+        let io = fty.uses_io();
+        BuiltinEntry {
+            name,
+            extcall_id: id,
+            arity: fty.prms.len(),
+            ty: fty,
+            ty_id: tid,
+            uses_io: io,
+        }
+    }
 }
 
 enum Entry {
@@ -44,11 +59,16 @@ impl FnType {
     fn new(r: TypeId, ps: Vec<TypeId>) -> FnType {
         FnType { ret: r, prms: ps }
     }
+
+    fn uses_io(&self) -> bool {
+        self.prms.iter().any(|&prm| prm == TypeSystem::IO_TY)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum UnboxedType {
     Fn(FnType),
+    AnyExt,
     Ext(ExtType),
     Tup(Vec<TypeId>),
 }
@@ -227,11 +247,13 @@ impl Node {
 
 struct TypeSystem {
     types: Vec<UnboxedType>,
+    any_ty: TypeId,
 }
 
 impl TypeSystem {
-    pub const I32_TY: TypeId = TypeId(Externals::I32_TY.index());
     pub const NIL_TY: TypeId = TypeId(Externals::NIL_TY.index());
+    pub const I32_TY: TypeId = TypeId(Externals::I32_TY.index());
+    pub const IO_TY: TypeId = TypeId(Externals::IO_TY.index());
 
     fn new() -> TypeSystem {
         let mut types = Vec::new();
@@ -243,7 +265,13 @@ impl TypeSystem {
                 name: ty_desc.name,
             }))
         }
-        TypeSystem { types }
+        let any = TypeId(types.len());
+        types.push(UnboxedType::AnyExt);
+        TypeSystem { types, any_ty: any }
+    }
+
+    fn any_extty(&self) -> TypeId {
+        self.any_ty
     }
 
     fn extty(&self, ty: ExtTy) -> TypeId {
@@ -283,26 +311,28 @@ impl Compiler {
     fn new() -> Compiler {
         let mut scope: Scope<String, Entry> = Scope::new();
         let mut ts = TypeSystem::new();
+        let any_ = ts.any_extty();
         let i32_ = TypeSystem::I32_TY;
+        let io_ = TypeSystem::IO_TY;
 
         scope.enter();
-        let builtins = [(
-            "@i32add",
-            Externals::I32_ADD,
-            FnType::new(i32_, vec![i32_, i32_]),
-        )];
+        let builtins = [
+            (
+                "@i32add",
+                Externals::I32_ADD,
+                FnType::new(i32_, vec![i32_, i32_]),
+            ),
+            (
+                "@print",
+                Externals::PRINT,
+                FnType::new(io_, vec![io_, any_]),
+            ),
+        ];
         for (n, i, t) in builtins {
-            let a = t.prms.len();
             let tid = ts.intern_ty(UnboxedType::Fn(t.clone()));
             scope.define(
                 n.to_string(),
-                Entry::Builtin(BuiltinEntry {
-                    name: n.to_string(),
-                    extcall_id: i,
-                    arity: a,
-                    ty: t,
-                    ty_id: tid,
-                }),
+                Entry::Builtin(BuiltinEntry::new(n.to_string(), i, t, tid)),
             );
         }
 

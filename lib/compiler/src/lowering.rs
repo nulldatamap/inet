@@ -24,6 +24,7 @@ pub enum Hir {
     Let(Name, Box<Hir>, Box<Hir>),
     Call(Box<Hir>, Vec<Hir>),
     Lam(Vec<Name>, Box<Hir>),
+    Ref(Box<Hir>, Box<Hir>),
     Tup(Vec<Hir>),
     Untup(Vec<Name>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
@@ -196,6 +197,11 @@ impl LowerSt {
     fn tup(&mut self, a: Reg, b: Reg, res: Reg) {
         self.insts
             .push(UInst::Binary(Tag::Comb, CombLabel::Tup.into(), res, a, b));
+    }
+
+    fn refv(&mut self, r_in: Reg, r_out: Reg, res: Reg) {
+        self.insts
+            .push(UInst::Binary(Tag::Comb, CombLabel::Ref.into(), res, r_in, r_out));
     }
 
     pub fn lower(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
@@ -410,6 +416,11 @@ impl LowerSt {
                     Ok(res)
                 })?;
                 self.expr(*tup, untup)?;
+            },
+            Ref(e0, e1) => {
+                let r_in = self.gen_expr(*e0)?;
+                let r_out = self.gen_expr(*e1)?;
+                self.refv(r_in, r_out, r);
             }
             Lift(expr) => todo!(),
             Lower(expr) => todo!(),
