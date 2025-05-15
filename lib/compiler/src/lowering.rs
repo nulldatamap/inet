@@ -80,6 +80,12 @@ pub struct Def {
     body: Hir,
 }
 
+impl Def {
+    pub fn new(name: String, body: Hir) -> Def {
+        Def { name, body }
+    }
+}
+
 type Scope = crate::scope::Scope<Name, Vec<Reg>>;
 
 pub struct LowerSt {

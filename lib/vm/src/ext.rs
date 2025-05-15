@@ -455,13 +455,14 @@ pub struct ExtVal<'h>(*mut (), PhantomData<&'h ()>);
 //         And SharedCell is effectively an Arc (which are all sync)
 //         So ExtVal should be Sync too
 unsafe impl<'h> Sync for ExtVal<'h> {}
+unsafe impl<'h> Send for ExtVal<'h> {}
 
 impl<'h> ExtVal<'h> {
     const VAL_SHIFT: usize = 3;
     const TY_SHIFT: usize = 48;
     const VAL_MASK: usize = (1 << Self::TY_SHIFT) - 1;
 
-    pub fn nil() -> ExtVal<'static> {
+    pub const fn nil() -> ExtVal<'static> {
         ExtVal(std::ptr::null_mut(), PhantomData)
     }
 
@@ -536,7 +537,7 @@ impl<'h> ExtVal<'h> {
         unsafe { ExtVal::from_parts(ty, ptr.as_ptr()) }
     }
 
-    fn get_imm<T: From<u32>>(&self) -> T {
+    pub fn get_imm<T: From<u32>>(&self) -> T {
         debug_assert!(self.ty().is_imm());
         // SAFETY: It's safe to call addr() because immediates
         //         don't have to worry about ref-counting

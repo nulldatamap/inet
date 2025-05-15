@@ -113,6 +113,20 @@ impl<'h> Rt<'h> {
         }
     }
 
+    pub fn normalize(&mut self) {
+        loop {
+            while let Some((a, b)) = self.active_fast.pop() {
+                self.interact(a, b);
+            }
+
+            if let Some((a, b)) = self.active_slow.pop() {
+                self.interact(a, b);
+            } else {
+                break;
+            }
+        }
+    }
+
     fn copy(&mut self, a: Port<'h>, b: Port<'h>) {
         let (l, r) = b.aux();
         self.link_wire(l, a.dup());
@@ -217,7 +231,13 @@ impl<'h> Rt<'h> {
         debug_assert!(self.registers.iter().all(|r| r.is_none()));
     }
 
-    pub fn invoke_builtin(&mut self, f: usize, x: ExtVal<'h>, y: ExtVal<'h>, flipped: bool) -> ExtVal<'h> {
+    pub fn invoke_builtin(
+        &mut self,
+        f: usize,
+        x: ExtVal<'h>,
+        y: ExtVal<'h>,
+        flipped: bool,
+    ) -> ExtVal<'h> {
         let (a, b) = if flipped { (y, x) } else { (x, y) };
         self.externals.extfns[f](self, a, b)
     }
@@ -240,16 +260,17 @@ impl<'h> Rt<'h> {
         unsafe { v.get_unique_unchecked() }
     }
 
-    pub fn erase(&self, p: ExtVal<'h>) {
+    pub fn erase<'a>(&self, p: ExtVal<'a>) {
         p.erase(&self.externals);
     }
 
     pub fn erase_unique<T: Tracked>(&self, mut u: UniqueCell<T>) {
         // SAFETY: it's safe to erase the cell in place because we forget it right afterwards
-        unsafe { u.erase_in_place(&self.externals); }
+        unsafe {
+            u.erase_in_place(&self.externals);
+        }
         std::mem::forget(u);
     }
-
 }
 
 impl<'h> fmt::Debug for Rt<'h> {

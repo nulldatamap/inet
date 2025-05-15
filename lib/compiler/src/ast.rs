@@ -2,10 +2,17 @@ use crate::reader::SExp::*;
 use crate::reader::{Bracket, SExp};
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub name: String,
+    pub expr: Expr,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum Expr {
     Var(String),
     Invoke(Box<Expr>, Vec<Expr>),
     Lit(Literal),
+    Let(Vec<Binding>, Vec<Expr>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,6 +54,13 @@ impl Expr {
                     todo!("empty list")
                 }
 
+                if let Ident(head) = &es[0] {
+                    match &**head {
+                        "let" => return Expr::parse_let(es),
+                        _ => {}
+                    }
+                }
+
                 Invoke(
                     Box::new(Expr::parse(&es[0])?),
                     es[1..]
@@ -59,6 +73,38 @@ impl Expr {
             SExp::Keyword(kw) => Lit(Literal::Keyword(kw.clone())),
             Quote(e) => todo!("quotes"),
         })
+    }
+
+    fn parse_let(es: &[SExp]) -> Result<Expr> {
+        if es.len() < 2 {
+            return Err("Expected bindings for `let`".to_string());
+        }
+
+        match &es[1] {
+            List(Bracket::Square, bs) => {
+                let (pairs, remaining) = bs.as_chunks::<2>();
+                if remaining.len() != 0 {
+                    return Err("`let` has a binding missing a value".to_string());
+                }
+                let mut bindings = Vec::new();
+                for [x, v] in pairs {
+                    let Ident(x) = x else {
+                        return Err("Expected a symbol for `let` binding left-hand side".to_string());
+                    };
+                    let e = Expr::parse(v)?;
+                    bindings.push(Binding {
+                        name: x.to_string(),
+                        expr: e,
+                    });
+                }
+                let body = es[2..]
+                    .into_iter()
+                    .map(Expr::parse)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::Let(bindings, body))
+            }
+            _ => return Err("Expected `let` bindings, use `[]` for the bindings".to_string()),
+        }
     }
 }
 

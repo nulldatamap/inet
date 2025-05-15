@@ -349,9 +349,10 @@ impl Compiler {
         Name::new(x, i)
     }
 
-    pub fn compile(e: Expr) -> Result<Node> {
+    pub fn compile(e: Expr) -> Result<Hir> {
         let mut c = Compiler::new();
-        c.expr(e)
+        let boxed_r = c.conv_expr(e, Metadata::any_io())?;
+        Ok(c.unbox_node(boxed_r))
     }
 
     fn undefined_var<T>(&self, x: &str) -> Result<T> {
@@ -396,25 +397,29 @@ impl Compiler {
         ))
     }
 
+    fn box_node(&mut self, n: Node) -> Hir {
+        let ty = n.meta.type_info.unboxed_type().unwrap();
+        Hir::Tup(vec![
+            // TODO: Use a value that is stable between Compiler instances
+            Hir::I32(ty.0 as i32),
+            n.hir,
+        ])
+    }
+
+    fn unbox_node(&mut self, v: Hir) -> Hir {
+        let box_ty = self.gen("__box_ty");
+        let box_val = self.gen("__box_val");
+        Hir::Untup(
+            vec![box_ty, box_val.clone()],
+            Box::new(v),
+            Box::new(Hir::Var(box_val)),
+        )
+    }
+
     fn perform_conv_action(&mut self, ma: ConvAction, n: Node) -> Hir {
         match ma {
-            ConvAction::Box => {
-                let ty = n.meta.type_info.unboxed_type().unwrap();
-                Hir::Tup(vec![
-                    // TODO: Use a value that is stable between Compiler instances
-                    Hir::I32(ty.0 as i32),
-                    n.hir,
-                ])
-            }
-            ConvAction::Unbox(_) => {
-                let box_ty = self.gen("__box_ty");
-                let box_val = self.gen("__box_val");
-                Hir::Untup(
-                    vec![box_ty, box_val.clone()],
-                    Box::new(n.hir),
-                    Box::new(Hir::Var(box_val)),
-                )
-            }
+            ConvAction::Box => self.box_node(n),
+            ConvAction::Unbox(_) => self.unbox_node(n.hir),
         }
     }
 
@@ -434,6 +439,34 @@ impl Compiler {
     pub(crate) fn expr(&mut self, e: Expr) -> Result<Node> {
         match e {
             Expr::Var(x) => self.var(x),
+            Expr::Let(bs, mut es) => {
+                let mut xs = Vec::new();
+                // TODO: IO sequencing
+                for b in bs {
+                    let b_name = self.gen(b.name.clone());
+                    self.scope.define(
+                        b.name.clone(),
+                        Entry::Var(VarEntry {
+                            name: b_name,
+                            type_info: TypeInfo::Any,
+                        }),
+                    );
+                    xs.push((b.name, self.conv_expr(b.expr, Metadata::any_io())?));
+                }
+                // TODO: IO sequencing
+                let body = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
+                let Node { mut hir, meta } = body;
+                for (n, x) in xs.into_iter().rev() {
+                    let Entry::Var(VarEntry { name, .. }) = self.scope.undefine(&n) else {
+                        return Err(
+                            "ICE: Didn't get a var scope when cleaning up `let` expression"
+                                .to_string(),
+                        );
+                    };
+                    hir = Hir::Let(name, Box::new(x), Box::new(hir));
+                }
+                Ok(Node { hir, meta })
+            }
             Expr::Invoke(f, es) => {
                 if let Expr::Var(head) = &*f {
                     match self.scope.lookup(&head) {
@@ -533,11 +566,22 @@ impl Compiler {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        num::NonZeroUsize,
+        sync::Mutex,
+    };
+
     use super::*;
     use crate::ast::Expr;
     use crate::lowering::*;
     use crate::reader::read;
-    use vm::ext::{ExtTy, Externals};
+    use vm::{
+        ext::{ExtTy, ExtVal, Externals},
+        heap::Heap,
+        program::link_programs,
+        repr::Port,
+        rt::Rt,
+    };
 
     fn t(i: ExtTy) -> TypeId {
         TypeId(i.index())
@@ -597,5 +641,54 @@ mod tests {
             ))
         );
         assert!(c("(@i32add true nil)").is_err());
+    }
+
+    #[test]
+    fn eval() {
+        static TEST_RESULT: Mutex<ExtVal<'static>> = Mutex::new(ExtVal::nil());
+
+        fn get_test_result() -> ExtVal<'static> {
+            let mut result = TEST_RESULT.lock().unwrap();
+            std::mem::replace(&mut *result, ExtVal::nil())
+        }
+
+        let h = Heap::new(NonZeroUsize::new(4096).unwrap());
+        let mut exts = Externals::builtins();
+        let ext_store_test_result = exts.extfns.len() as u16;
+        exts.extfns.push(|rt, x, y| {
+            let mut test_result = TEST_RESULT.lock().unwrap();
+            rt.erase(std::mem::replace(
+                &mut *test_result,
+                ExtVal::imm(x.ty(), x.get_imm::<u32>()),
+            ));
+            y
+        });
+        let mut rt = Rt::new(&h, exts);
+
+        let cases = [
+            ("3", ExtVal::i32(3)),
+            ("(@i32add 1 3)", ExtVal::i32(4)),
+            ("(@i32add (@i32add 0 1) (@i32add 2 3))", ExtVal::i32(6)),
+            ("(let [x 9 y x] y)", ExtVal::i32(9))
+        ];
+
+        for (i, (src, expected_val)) in cases.into_iter().enumerate() {
+            let case_name = format!("test_case#{}", i);
+            let test_body = Compiler::compile(Expr::parse(&read(src).unwrap()).unwrap()).unwrap();
+            let unlinked_program = LowerSt::lower(vec![Def::new(
+                case_name.clone(),
+                Hir::ExtCall(ext_store_test_result, vec![test_body]),
+            )])
+            .unwrap();
+            let case_program = link_programs(&unlinked_program[..]).unwrap();
+            rt.link(
+                Port::from_global(case_program.get(&case_name).unwrap()),
+                Port::from_extval(ExtVal::nil()),
+            );
+            rt.normalize();
+            let result = get_test_result();
+            assert_eq!(result.ty(), expected_val.ty());
+            assert_eq!(result.get_imm::<u32>(), expected_val.get_imm::<u32>());
+        }
     }
 }
