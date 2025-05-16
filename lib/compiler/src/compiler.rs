@@ -522,7 +522,7 @@ impl Compiler {
                 ))
             }
             Expr::If(e0, e1, e2) => {
-                // TODO: IO sequences
+                // TODO: IO sequencing
                 // TODO: Flow typing
                 let cond = self.expr(*e0)?;
                 let cond_val = match cond.meta.type_info {
@@ -559,6 +559,10 @@ impl Compiler {
                     meta,
                 })
             }
+            Expr::Do(mut es) => {
+                // TODO: IO Sequencing
+                self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))
+            },
             Expr::Lit(l) => self.lit(l),
         }
     }
@@ -773,6 +777,9 @@ mod tests {
             ("(if (if true nil 1) 1 0)", ExtVal::i32(0)),
             ("(if (if false nil 1) 1 0)", ExtVal::i32(1)),
             ("(let [x 3] (if x 1 0))", ExtVal::i32(1)),
+            ("(do 0 1 2 3)", ExtVal::i32(3)),
+            ("(do 0)", ExtVal::i32(0)),
+            ("(do)", ExtVal::nil()),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {

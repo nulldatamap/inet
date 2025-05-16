@@ -14,6 +14,7 @@ pub enum Expr {
     Lit(Literal),
     Let(Vec<Binding>, Vec<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Do(Vec<Expr>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +60,7 @@ impl Expr {
                     match &**head {
                         "let" => return Expr::parse_let(es),
                         "if" => return Expr::parse_if(es),
+                        "do" => return Expr::parse_do(es),
                         _ => {}
                     }
                 }
@@ -91,7 +93,9 @@ impl Expr {
                 let mut bindings = Vec::new();
                 for [x, v] in pairs {
                     let Ident(x) = x else {
-                        return Err("Expected a symbol for `let` binding left-hand side".to_string());
+                        return Err(
+                            "Expected a symbol for `let` binding left-hand side".to_string()
+                        );
                     };
                     let e = Expr::parse(v)?;
                     bindings.push(Binding {
@@ -110,14 +114,26 @@ impl Expr {
     }
 
     fn parse_if(es: &[SExp]) -> Result<Expr> {
-        if es.len() != 4  {
-            return Err("Expected exactly three values for `if`, a conditon, then-branch and else-branch".to_string());
+        if es.len() != 4 {
+            return Err(
+                "Expected exactly three values for `if`, a conditon, then-branch and else-branch"
+                    .to_string(),
+            );
         }
 
         Ok(Expr::If(
             Box::new(Expr::parse(&es[1])?),
             Box::new(Expr::parse(&es[2])?),
             Box::new(Expr::parse(&es[3])?),
+        ))
+    }
+
+    fn parse_do(es: &[SExp]) -> Result<Expr> {
+        Ok(Expr::Do(
+            es[1..]
+                .iter()
+                .map(|e| Expr::parse(e))
+                .collect::<Result<Vec<_>>>()?,
         ))
     }
 }
