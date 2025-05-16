@@ -443,6 +443,7 @@ impl Compiler {
                 let mut xs = Vec::new();
                 // TODO: IO sequencing
                 for b in bs {
+                    let val = self.conv_expr(b.expr, Metadata::any_io())?;
                     let b_name = self.gen(b.name.clone());
                     self.scope.define(
                         b.name.clone(),
@@ -451,7 +452,7 @@ impl Compiler {
                             type_info: TypeInfo::Any,
                         }),
                     );
-                    xs.push((b.name, self.conv_expr(b.expr, Metadata::any_io())?));
+                    xs.push((b.name, val));
                 }
                 // TODO: IO sequencing
                 let body = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
@@ -669,7 +670,9 @@ mod tests {
             ("3", ExtVal::i32(3)),
             ("(@i32add 1 3)", ExtVal::i32(4)),
             ("(@i32add (@i32add 0 1) (@i32add 2 3))", ExtVal::i32(6)),
-            ("(let [x 9 y x] y)", ExtVal::i32(9))
+            ("(let [x 9 y x] y)", ExtVal::i32(9)),
+            ("(let [x (@i32add 1 1) y x] y)", ExtVal::i32(2)),
+            ("(let [x 1] (let [x x] x))", ExtVal::i32(1)),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {

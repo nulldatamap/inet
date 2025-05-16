@@ -1,7 +1,7 @@
 use std::{collections::{hash_map::Entry, HashMap}, fmt};
 use std::hash::Hash;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Name(Option<String>, usize);
 
 impl Name {
@@ -30,7 +30,7 @@ impl Name {
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_none() && self.1 == 0 {
-            f.write_str("<unknown>");
+            return f.write_str("<unknown>");
         }
 
         let n = self.0.as_ref().map(|x| &x[..]).unwrap_or("__gen");
@@ -39,6 +39,12 @@ impl fmt::Display for Name {
         } else {
             write!(f, "{}#{}", n, self.1)
         }
+    }
+}
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
