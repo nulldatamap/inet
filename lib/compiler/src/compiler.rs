@@ -40,6 +40,15 @@ enum Entry {
     Builtin(BuiltinEntry),
 }
 
+impl Entry {
+    fn name(&self) -> Name {
+        match self {
+            Entry::Var(VarEntry { name, .. }) => name.clone(),
+            Entry::Builtin(BuiltinEntry { name, .. }) => Name::global(name),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Debug)]
 struct ExtType {
     id: u16,
@@ -47,7 +56,68 @@ struct ExtType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+struct UnboxedTypeId(usize);
+
+impl UnboxedTypeId {
+    fn from_raw(v: usize) -> UnboxedTypeId {
+        UnboxedTypeId(v)
+    }
+
+    fn index(&self) -> usize {
+        self.0
+    }
+}
+
+impl Into<TypeId> for UnboxedTypeId {
+    fn into(self) -> TypeId {
+        TypeId::from_raw(self.0)
+    }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 struct TypeId(usize);
+
+impl TypeId {
+    const TAG_SHIFT: usize = size_of::<usize>() * 8 - 1;
+    const TAG_MASK:usize = 1 << Self::TAG_SHIFT;
+
+    fn from_raw(v: usize) -> TypeId {
+        TypeId(v)
+    }
+
+    fn from_raw_parts(is_box: bool, v: usize) -> TypeId {
+        TypeId(v | if is_box { Self::TAG_MASK } else { 0 })
+    }
+
+    fn is_box(&self) -> bool {
+        (self.0 & Self::TAG_MASK) != 0
+    }
+
+    fn is_any(&self) -> bool {
+        self.0 == usize::MAX
+    }
+
+    fn raw_index(&self) -> usize {
+        self.0 & !Self::TAG_MASK
+    }
+
+    fn index(&self) -> Option<usize> {
+        if self.0 == usize::MAX {
+            None
+        } else {
+            Some(self.raw_index())
+        }
+    }
+
+    fn as_unboxed(&self) -> Option<UnboxedTypeId> {
+        if self.is_box() {
+            None
+        } else {
+            Some(UnboxedTypeId::from_raw(self.raw_index()))
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FnType {
@@ -67,6 +137,7 @@ impl FnType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum UnboxedType {
+    AnyFn,
     Fn(FnType),
     AnyExt,
     Ext(ExtType),
@@ -84,21 +155,21 @@ impl UnboxedType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TypeInfo {
-    Unboxed(TypeId),
-    Boxed(HashSet<TypeId>),
+    Unboxed(UnboxedTypeId),
+    Boxed(HashSet<UnboxedTypeId>),
     Any,
 }
 
 #[derive(Debug, Copy, Clone)]
 enum ConvAction {
     Box,
-    Unbox(TypeId),
+    Unbox(UnboxedTypeId),
 }
 
 #[derive(Debug)]
 enum ConvFailure {
-    TooNarrow(Option<HashSet<TypeId>>),
-    Mismatch(TypeId, TypeId),
+    TooNarrow(Option<HashSet<UnboxedTypeId>>),
+    Mismatch(UnboxedTypeId, UnboxedTypeId),
     CantPurify,
 }
 
@@ -110,7 +181,7 @@ impl TypeInfo {
         }
     }
 
-    fn unboxed_type(&self) -> Option<TypeId> {
+    fn unboxed_type(&self) -> Option<UnboxedTypeId> {
         match self {
             TypeInfo::Unboxed(ut) => Some(*ut),
             _ => None,
@@ -217,7 +288,7 @@ impl Metadata {
         }
     }
 
-    fn unboxed(ti: TypeId) -> Metadata {
+    fn unboxed(ti: UnboxedTypeId) -> Metadata {
         Metadata {
             type_info: TypeInfo::Unboxed(ti),
             uses_io: false,
@@ -254,8 +325,10 @@ impl Node {
 }
 
 struct TypeSystem {
-    types: Vec<UnboxedType>,
-    any_ty: TypeId,
+    unboxed_types: Vec<UnboxedType>,
+    boxed_types: Vec<TypeInfo>,
+    any_extty: TypeId,
+    any_fnty: TypeId,
     extty_count: usize,
 }
 
@@ -264,23 +337,29 @@ impl TypeSystem {
     pub const I32_TY: TypeId = TypeId(Externals::I32_TY.index());
     pub const IO_TY: TypeId = TypeId(Externals::IO_TY.index());
 
+    pub const TYPE_TAG_SHIFT: usize = 16;
+
     fn new() -> TypeSystem {
-        let mut types = Vec::new();
+        let mut unboxed_types = Vec::new();
         let mut descs = Externals::ext_ty_descs();
         // TODO: Doesn't work for custom extty?
         descs.sort_by_key(|d| d.index);
         for ty_desc in descs {
-            types.push(UnboxedType::Ext(ExtType {
+            unboxed_types.push(UnboxedType::Ext(ExtType {
                 id: ty_desc.index as u16,
                 name: ty_desc.name,
             }))
         }
-        let any = TypeId(types.len());
-        types.push(UnboxedType::AnyExt);
-        let extty_count = types.len();
+        let extty_count = unboxed_types.len();
+        let any_extty = TypeId(unboxed_types.len());
+        unboxed_types.push(UnboxedType::AnyExt);
+        let any_fnty = TypeId(unboxed_types.len());
+        unboxed_types.push(UnboxedType::AnyFn);
         TypeSystem {
-            types,
-            any_ty: any,
+            unboxed_types,
+            boxed_types: Vec::new(),
+            any_extty,
+            any_fnty,
             extty_count,
         }
     }
@@ -290,7 +369,11 @@ impl TypeSystem {
     }
 
     fn any_extty(&self) -> TypeId {
-        self.any_ty
+        self.any_extty
+    }
+
+    fn any_fnty(&self) -> TypeId {
+        self.any_fnty
     }
 
     fn extty(&self, ty: ExtTy) -> TypeId {
@@ -313,6 +396,17 @@ impl TypeSystem {
             let idx = self.types.len();
             self.types.push(ut);
             TypeId(idx)
+        }
+    }
+
+    fn type_tag(&self, tid: TypeId) -> i32 {
+        use UnboxedType::*;
+        let ty = self.ty(tid);
+        match ty {
+            AnyExt | AnyFn => panic!("Type `{:?}` is not taggable!", ty),
+            Fn(fty) => self.any_fnty().0 as i32 | (fty.prms.len() as (i32) << Self::TYPE_TAG_SHIFT),
+            Ext(ty) => ty.id as i32,
+            Tup(_) => todo!("Tuple tagging"),
         }
     }
 }
@@ -417,10 +511,10 @@ impl Compiler {
     }
 
     fn box_node(&mut self, n: Node) -> Hir {
-        let ty = n.meta.type_info.unboxed_type().unwrap();
+        let tid = n.meta.type_info.unboxed_type().unwrap();
         Hir::Tup(vec![
             // TODO: Use a value that is stable between Compiler instances
-            Hir::I32(ty.0 as i32),
+            Hir::I32(self.type_system.type_tag(tid)),
             n.hir,
         ])
     }
@@ -477,13 +571,7 @@ impl Compiler {
                 let body = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
                 let Node { mut hir, meta } = body;
                 for (n, x) in xs.into_iter().rev() {
-                    let Entry::Var(VarEntry { name, .. }) = self.scope.undefine(&n) else {
-                        return Err(
-                            "ICE: Didn't get a var scope when cleaning up `let` expression"
-                                .to_string(),
-                        );
-                    };
-                    hir = Hir::Let(name, Box::new(x), Box::new(hir));
+                    hir = Hir::Let(self.scope.undefine(&n).name(), Box::new(x), Box::new(hir));
                 }
                 Ok(Node { hir, meta })
             }
@@ -512,7 +600,7 @@ impl Compiler {
                     }
                 }
                 Ok(Node::new(
-                    Hir::Call(
+                    Hir::CurryCall(
                         Box::new(self.conv_expr(*f, &Metadata::any_io())?),
                         es.into_iter()
                             .map(|e| self.conv_expr(e, &Metadata::any_io()))
@@ -562,7 +650,43 @@ impl Compiler {
             Expr::Do(mut es) => {
                 // TODO: IO Sequencing
                 self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))
-            },
+            }
+            Expr::Fn(ps, mut es) => {
+                for p in &ps {
+                    let name = self.gen(p.clone());
+                    self.scope.define(
+                        p.clone(),
+                        Entry::Var(VarEntry {
+                            name,
+                            type_info: TypeInfo::Any,
+                        }),
+                    );
+                }
+                let Node{ hir: body, meta: ret_meta } = self.conv_expr(
+                    es.pop().unwrap_or(Expr::Lit(Literal::Nil)),
+                    &Metadata::any_io(),
+                )?;
+                let (prms_var, body) = if ps.len() == 1 {
+                    (self.scope.undefine(&ps[0]).name(), body)
+                } else {
+                    let prms_var = self.gen("__prms");
+                    (
+                        prms_var,
+                        Hir::Untup(
+                            ps.into_iter()
+                                .map(|p| self.scope.undefine(&p).name())
+                                .collect::<Vec<_>>(),
+                            Box::new(Hir::Var(prms_var)),
+                            Box::new(body),
+                        ),
+                    )
+                };
+                let ret_ty = self.type_system.ty(ret_meta.type_info);
+                Node::new(Hir::Lam(prms_var, Box::new(body)), Metadata {
+                    type_info: TypeInfo::Unboxed(UnboxedType::Fn(ret_ty))
+                    uses_io: ret_meta.uses_io,
+                })
+            }
             Expr::Lit(l) => self.lit(l),
         }
     }
@@ -629,7 +753,7 @@ impl Compiler {
                     .collect::<Vec<_>>();
 
                 Ok(Node::new(
-                    Hir::Lam(names, Box::new(Hir::ExtCall(ext, args))),
+                    Hir::CurryLam(names, Box::new(Hir::ExtCall(ext, args))),
                     Metadata::unboxed(fn_ty),
                 ))
             }
@@ -722,7 +846,7 @@ mod tests {
         assert_eq!(
             c("@i32add"),
             Ok(Node::new(
-                Hir::Lam(
+                Hir::CurryLam(
                     vec![Name::new("__arg", 1), Name::new("__arg", 2)],
                     Box::new(Hir::ExtCall(
                         Externals::I32_ADD,

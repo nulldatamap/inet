@@ -22,8 +22,10 @@ pub enum Hir {
     Add(Box<Hir>, Box<Hir>),
     If(Box<Hir>, Box<Hir>, Box<Hir>),
     Let(Name, Box<Hir>, Box<Hir>),
-    Call(Box<Hir>, Vec<Hir>),
-    Lam(Vec<Name>, Box<Hir>),
+    Call(Box<Hir>, Box<Hir>),
+    Lam(Name, Box<Hir>),
+    CurryCall(Box<Hir>, Vec<Hir>),
+    CurryLam(Vec<Name>, Box<Hir>),
     Ref(Box<Hir>, Box<Hir>),
     Tup(Vec<Hir>),
     Untup(Vec<Name>, Box<Hir>, Box<Hir>),
@@ -48,10 +50,10 @@ pub fn print(a: Hir, b: Hir) -> Hir {
     Hir::ExtCall(Externals::PRINT, vec![a, b])
 }
 pub fn lam(xs: Vec<&'static str>, b: Hir) -> Hir {
-    Hir::Lam(xs.iter().map(|x| Name::global(x)).collect(), Box::new(b))
+    Hir::CurryLam(xs.iter().map(|x| Name::global(x)).collect(), Box::new(b))
 }
 pub fn call(f: Hir, xs: Vec<Hir>) -> Hir {
-    Hir::Call(Box::new(f), xs)
+    Hir::CurryCall(Box::new(f), xs)
 }
 pub fn if_(c: Hir, t: Hir, f: Hir) -> Hir {
     Hir::If(Box::new(c), Box::new(t), Box::new(f))
@@ -342,10 +344,24 @@ impl LowerSt {
                 let b = self.gen_expr(*e1)?;
                 self.extcall(Externals::I32_ADD, a, b, r);
             }
-            Call(f, mut es) => {
+            Call(f, e) => {
+                let f = self.gen_expr(*f)?;
+                let e = self.gen_expr(*e)?;
+                self.app(f, e, r);
+            }
+            Lam(prm, e) => {
+                let prms = &[prm];
+                let (body, mut prm_users) = self.scoped(prms, |c| c.gen_expr(*e))?;
+                let users = prm_users.next().unwrap();
+                debug_assert!(prm_users.next().is_none());
+                drop(prm_users);
+                let x = self.materialize_users(users)?;
+                self.lam(x, body, r);
+            }
+            CurryCall(f, mut es) => {
                 if es.is_empty() {
                     // Call `f` with a dummy value
-                    es.push(Hir::I32(0));
+                    es.push(Hir::Nil);
                 }
                 // Generate:
                 //   f = fn(e0 fn(e1 fn(e2 r)))
@@ -358,7 +374,7 @@ impl LowerSt {
                 })?;
                 self.expr(*f, f_reg)?;
             }
-            Lam(prms, e) => {
+            CurryLam(prms, e) => {
                 let (body, prm_users) = self.scoped(&prms, |c| c.gen_expr(*e))?;
                 let mut prm_users = prm_users.collect::<Vec<_>>();
 

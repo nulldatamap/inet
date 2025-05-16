@@ -15,6 +15,7 @@ pub enum Expr {
     Let(Vec<Binding>, Vec<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Do(Vec<Expr>),
+    Fn(Vec<String>, Vec<Expr>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -61,6 +62,7 @@ impl Expr {
                         "let" => return Expr::parse_let(es),
                         "if" => return Expr::parse_if(es),
                         "do" => return Expr::parse_do(es),
+                        "fn" => return Expr::parse_fn(es),
                         _ => {}
                     }
                 }
@@ -135,6 +137,30 @@ impl Expr {
                 .map(|e| Expr::parse(e))
                 .collect::<Result<Vec<_>>>()?,
         ))
+    }
+
+    fn parse_fn(es: &[SExp]) -> Result<Expr> {
+        if es.len() < 2 {
+            return Err("Expected `fn` parameter list".to_string());
+        }
+
+        match &es[1] {
+            List(Bracket::Square, ps) => {
+                let ns = ps
+                    .iter()
+                    .map(|p| match p {
+                        Ident(n) => Ok(n.clone()),
+                        _ => Err("Expected a valid parameter name".to_string()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let xs = es[2..]
+                    .iter()
+                    .map(|e| Expr::parse(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::Fn(ns, xs))
+            }
+            _ => return Err("Expected `fn` parameters, use `[]` for them".to_string()),
+        }
     }
 }
 
