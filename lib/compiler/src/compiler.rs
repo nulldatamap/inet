@@ -73,6 +73,15 @@ enum UnboxedType {
     Tup(Vec<TypeId>),
 }
 
+impl UnboxedType {
+    fn is_extty(&self) -> bool {
+        match self {
+            UnboxedType::AnyExt | UnboxedType::Ext(_) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TypeInfo {
     Unboxed(TypeId),
@@ -80,12 +89,13 @@ enum TypeInfo {
     Any,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 enum ConvAction {
     Box,
     Unbox(TypeId),
 }
 
+#[derive(Debug)]
 enum ConvFailure {
     TooNarrow(Option<HashSet<TypeId>>),
     Mismatch(TypeId, TypeId),
@@ -107,21 +117,22 @@ impl TypeInfo {
         }
     }
 
-    fn merge(&self, other: &TypeInfo) -> (TypeInfo, Option<ConvAction>) {
+    fn merge(&self, other: &TypeInfo) -> TypeInfo {
         use TypeInfo::*;
 
+        if self == other {
+            return self.clone();
+        }
+
         match (self, other) {
-            (Any, _) | (_, Any) => (Any, None),
-            (Unboxed(t0), Unboxed(t1)) => (
-                Boxed(HashSet::from([t0.clone(), t1.clone()])),
-                Some(ConvAction::Box),
-            ),
+            (Any, _) | (_, Any) => Any,
+            (Unboxed(t0), Unboxed(t1)) => Boxed(HashSet::from([t0.clone(), t1.clone()])),
             (Unboxed(t0), Boxed(ts)) | (Boxed(ts), Unboxed(t0)) => {
                 let mut ts = ts.clone();
                 ts.insert(t0.clone());
-                (Boxed(ts), Some(ConvAction::Box))
+                Boxed(ts)
             }
-            (Boxed(ts0), Boxed(ts1)) => (Boxed(ts0 | ts1), None),
+            (Boxed(ts0), Boxed(ts1)) => Boxed(ts0 | ts1),
         }
     }
 
@@ -149,7 +160,7 @@ impl TypeInfo {
                     TypeInfo::Unboxed(ub) => {
                         // Same logic as above, but with a single element instead
                         if tys.contains(ub) {
-                            Ok(None)
+                            Ok(Some(ConvAction::Box))
                         } else {
                             Err(ConvFailure::TooNarrow(Some(HashSet::from([*ub]))))
                         }
@@ -213,15 +224,12 @@ impl Metadata {
         }
     }
 
-    fn merge(&self, other: &Self) -> (Metadata, Option<ConvAction>) {
-        let (ti, ma) = self.type_info.merge(&other.type_info);
-        (
-            Metadata {
-                uses_io: self.uses_io || other.uses_io,
-                type_info: ti,
-            },
-            ma,
-        )
+    fn merge(&self, other: &Self) -> Metadata {
+        let ti = self.type_info.merge(&other.type_info);
+        Metadata {
+            uses_io: self.uses_io || other.uses_io,
+            type_info: ti,
+        }
     }
 
     fn conversion(&self, to: &Self) -> result::Result<Option<ConvAction>, ConvFailure> {
@@ -248,6 +256,7 @@ impl Node {
 struct TypeSystem {
     types: Vec<UnboxedType>,
     any_ty: TypeId,
+    extty_count: usize,
 }
 
 impl TypeSystem {
@@ -258,6 +267,7 @@ impl TypeSystem {
     fn new() -> TypeSystem {
         let mut types = Vec::new();
         let mut descs = Externals::ext_ty_descs();
+        // TODO: Doesn't work for custom extty?
         descs.sort_by_key(|d| d.index);
         for ty_desc in descs {
             types.push(UnboxedType::Ext(ExtType {
@@ -267,7 +277,16 @@ impl TypeSystem {
         }
         let any = TypeId(types.len());
         types.push(UnboxedType::AnyExt);
-        TypeSystem { types, any_ty: any }
+        let extty_count = types.len();
+        TypeSystem {
+            types,
+            any_ty: any,
+            extty_count,
+        }
+    }
+
+    fn extty_count(&self) -> usize {
+        self.extty_count
     }
 
     fn any_extty(&self) -> TypeId {
@@ -351,7 +370,7 @@ impl Compiler {
 
     pub fn compile(e: Expr) -> Result<Hir> {
         let mut c = Compiler::new();
-        let boxed_r = c.conv_expr(e, Metadata::any_io())?;
+        let boxed_r = c.conv_expr(e, &Metadata::any_io())?;
         Ok(c.unbox_node(boxed_r))
     }
 
@@ -423,15 +442,15 @@ impl Compiler {
         }
     }
 
-    fn convert(&mut self, n: Node, to: Metadata) -> Result<Hir> {
+    fn convert(&mut self, n: Node, to: &Metadata) -> Result<Hir> {
         match n.meta.conversion(&to) {
-            Err(err) => self.conv_failed(&n.meta, &to, err),
+            Err(err) => self.conv_failed(&n.meta, to, err),
             Ok(None) => Ok(n.hir),
             Ok(Some(ca)) => Ok(self.perform_conv_action(ca, n)),
         }
     }
 
-    fn conv_expr(&mut self, e: Expr, to: Metadata) -> Result<Hir> {
+    fn conv_expr(&mut self, e: Expr, to: &Metadata) -> Result<Hir> {
         let node = self.expr(e)?;
         self.convert(node, to)
     }
@@ -443,7 +462,7 @@ impl Compiler {
                 let mut xs = Vec::new();
                 // TODO: IO sequencing
                 for b in bs {
-                    let val = self.conv_expr(b.expr, Metadata::any_io())?;
+                    let val = self.conv_expr(b.expr, &Metadata::any_io())?;
                     let b_name = self.gen(b.name.clone());
                     self.scope.define(
                         b.name.clone(),
@@ -485,7 +504,7 @@ impl Compiler {
                             let ret = ty.ret;
                             let mut args = Vec::new();
                             for (e, prm) in es.into_iter().zip(ty.prms.clone().iter()) {
-                                args.push(self.conv_expr(e, Metadata::unboxed(*prm))?);
+                                args.push(self.conv_expr(e, &Metadata::unboxed(*prm))?);
                             }
                             return Ok(Node::new(Hir::ExtCall(id, args), Metadata::unboxed(ret)));
                         }
@@ -494,16 +513,90 @@ impl Compiler {
                 }
                 Ok(Node::new(
                     Hir::Call(
-                        Box::new(self.conv_expr(*f, Metadata::any_io())?),
+                        Box::new(self.conv_expr(*f, &Metadata::any_io())?),
                         es.into_iter()
-                            .map(|e| self.conv_expr(e, Metadata::any_io()))
+                            .map(|e| self.conv_expr(e, &Metadata::any_io()))
                             .collect::<Result<Vec<_>>>()?,
                     ),
                     Metadata::any_io(),
                 ))
             }
+            Expr::If(e0, e1, e2) => {
+                // TODO: IO sequences
+                // TODO: Flow typing
+                let cond = self.expr(*e0)?;
+                let cond_val = match cond.meta.type_info {
+                    TypeInfo::Unboxed(t) => {
+                        let ty = self.type_system.ty(t);
+                        if !ty.is_extty() {
+                            // We can't directly pass a tuple/fn to an `if`
+                            // But they're always considered truthy anyway
+                            // So just return the `then` branch
+                            return self.expr(*e1);
+                        }
+                        cond.hir
+                    }
+                    TypeInfo::Boxed(ts) => {
+                        // Same idea as above
+                        if ts.iter().all(|t| !self.type_system.ty(*t).is_extty()) {
+                            return self.expr(*e1);
+                        }
+                        // Otherwise we actually have to inspect the box type
+                        // to safely construct a thruthy value
+                        self.truth_of_expr(cond.hir, Some(ts))?
+                    }
+                    TypeInfo::Any => self.truth_of_expr(cond.hir, None)?,
+                };
+                let b_then = self.expr(*e1)?;
+                let b_else = self.expr(*e2)?;
+                let meta = b_then.meta.merge(&b_else.meta);
+                Ok(Node {
+                    hir: Hir::If(
+                        Box::new(cond_val),
+                        Box::new(self.convert(b_then, &meta)?),
+                        Box::new(self.convert(b_else, &meta)?),
+                    ),
+                    meta,
+                })
+            }
             Expr::Lit(l) => self.lit(l),
         }
+    }
+
+    fn truth_of_expr(&mut self, e: Hir, tys: Option<HashSet<TypeId>>) -> Result<Hir> {
+        // If all the possibly values `e` can be are all exttys then we can safely
+        // pass it unboxed
+        if tys
+            .as_ref()
+            .map(|tys| tys.iter().all(|t| self.type_system.ty(*t).is_extty()))
+            .unwrap_or(false)
+        {
+            return Ok(self.unbox_node(e));
+        }
+
+        // ExtTys' truthiness is their unboxed value
+        // While tuples and fns are always truthy
+        let e_ty = self.gen("__box_ty");
+        let e_val = self.gen("__box_val");
+        // let (__box_ty, __box_val) = e
+        // if __box_ty < EXTTY_COUNT
+        // then __box_val
+        // else true
+        Ok(Hir::Untup(
+            vec![e_ty.clone(), e_val.clone()],
+            Box::new(e),
+            Box::new(Hir::If(
+                Box::new(Hir::ExtCall(
+                    Externals::I32_LT,
+                    vec![
+                        Hir::Var(e_ty),
+                        Hir::I32(self.type_system.extty_count() as i32),
+                    ],
+                )),
+                Box::new(Hir::Var(e_val)),
+                Box::new(Hir::I32(1)),
+            )),
+        ))
     }
 
     fn var(&mut self, x: String) -> Result<Node> {
@@ -567,10 +660,7 @@ impl Compiler {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        num::NonZeroUsize,
-        sync::Mutex,
-    };
+    use std::{num::NonZeroUsize, sync::Mutex};
 
     use super::*;
     use crate::ast::Expr;
@@ -673,11 +763,23 @@ mod tests {
             ("(let [x 9 y x] y)", ExtVal::i32(9)),
             ("(let [x (@i32add 1 1) y x] y)", ExtVal::i32(2)),
             ("(let [x 1] (let [x x] x))", ExtVal::i32(1)),
+            ("(if true 1 0)", ExtVal::i32(1)),
+            ("(if false 1 0)", ExtVal::i32(0)),
+            ("(if (@i32add 1 0) 1 0)", ExtVal::i32(1)),
+            ("(if (@i32add 0 0) 1 0)", ExtVal::i32(0)),
+            ("(if nil nil 0)", ExtVal::i32(0)),
+            ("(if nil 0 nil)", ExtVal::nil()),
+            ("(if (if true true false) 1 0)", ExtVal::i32(1)),
+            ("(if (if true nil 1) 1 0)", ExtVal::i32(0)),
+            ("(if (if false nil 1) 1 0)", ExtVal::i32(1)),
+            ("(let [x 3] (if x 1 0))", ExtVal::i32(1)),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
             let case_name = format!("test_case#{}", i);
+            println!("=== {}\n{}\n\n", case_name, src);
             let test_body = Compiler::compile(Expr::parse(&read(src).unwrap()).unwrap()).unwrap();
+            println!("{:?}\n\n", test_body);
             let unlinked_program = LowerSt::lower(vec![Def::new(
                 case_name.clone(),
                 Hir::ExtCall(ext_store_test_result, vec![test_body]),

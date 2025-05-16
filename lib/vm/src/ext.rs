@@ -745,6 +745,7 @@ impl Externals {
     pub const MK_ARGS: u16 = 5;
     pub const ARGS_PUSH: u16 = 6;
     pub const ARR_SET: u16 = 7;
+    pub const I32_LT: u16 = 8;
 
     pub fn ext_ty_descs() -> Vec<ExtTyDesc> {
         vec![
@@ -846,6 +847,11 @@ impl Externals {
                 { let xs = rt.get_cell_mut::<[ExtVal]>(&mut xs).expect("Can't modify array, more than one reference exists!");
                 rt.erase(std::mem::replace(&mut xs[i.get_imm::<u32>() as usize], v)); }
                 xs
+            },
+            I32_LT: |_rt, x, y| {
+                assert_eq!(x.ty(), Self::I32_TY);
+                assert_eq!(y.ty(), Self::I32_TY);
+                ExtVal::i32(if x.get_i32() < y.get_i32() { 1 } else { 0 })
             }
 
         );

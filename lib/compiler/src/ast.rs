@@ -13,6 +13,7 @@ pub enum Expr {
     Invoke(Box<Expr>, Vec<Expr>),
     Lit(Literal),
     Let(Vec<Binding>, Vec<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl Expr {
                 if let Ident(head) = &es[0] {
                     match &**head {
                         "let" => return Expr::parse_let(es),
+                        "if" => return Expr::parse_if(es),
                         _ => {}
                     }
                 }
@@ -105,6 +107,18 @@ impl Expr {
             }
             _ => return Err("Expected `let` bindings, use `[]` for the bindings".to_string()),
         }
+    }
+
+    fn parse_if(es: &[SExp]) -> Result<Expr> {
+        if es.len() != 4  {
+            return Err("Expected exactly three values for `if`, a conditon, then-branch and else-branch".to_string());
+        }
+
+        Ok(Expr::If(
+            Box::new(Expr::parse(&es[1])?),
+            Box::new(Expr::parse(&es[2])?),
+            Box::new(Expr::parse(&es[3])?),
+        ))
     }
 }
 
