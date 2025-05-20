@@ -1030,15 +1030,22 @@ mod tests {
                 Metadata::pure(any2_fn_ty)
             ))
         );
+        assert_eq!(c("((if true (fn [] nil) (fn [] 0)))"), Err("wow".to_string()));
     }
 
     #[test]
     fn eval() {
-        static TEST_RESULT: Mutex<ExtVal<'static>> = Mutex::new(ExtVal::nil());
+        static TEST_RESULT: Mutex<(usize, ExtVal<'static>)> = Mutex::new((0, ExtVal::nil()));
 
         fn get_test_result() -> ExtVal<'static> {
             let mut result = TEST_RESULT.lock().unwrap();
-            std::mem::replace(&mut *result, ExtVal::nil())
+            let (cnt, res) = std::mem::replace(&mut *result, (0, ExtVal::nil()));
+            if cnt < 0 {
+                panic!("No test result was set!");
+            } else if cnt > 1 {
+                panic!("Multiple ({}) test results were set!", cnt)
+            }
+            res
         }
 
         let h = Heap::new(NonZeroUsize::new(4096).unwrap());
@@ -1047,9 +1054,10 @@ mod tests {
         exts.extfns.push(|rt, x, y| {
             let mut test_result = TEST_RESULT.lock().unwrap();
             rt.erase(std::mem::replace(
-                &mut *test_result,
+                &mut test_result.1,
                 ExtVal::imm(x.ty(), x.get_imm::<u32>()),
             ));
+            test_result.0 += 1;
             y
         });
         let mut rt = Rt::new(&h, exts);
@@ -1083,6 +1091,7 @@ mod tests {
                 ExtVal::i32(2),
             ),
             ("((if true (fn [] 0) (fn [] nil)))", ExtVal::i32(0)),
+            ("((if false (fn [] 0) (fn [] nil)))", ExtVal::nil()),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
