@@ -74,13 +74,14 @@ impl Into<TypeId> for UnboxedTypeId {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 struct TypeId(usize);
 
 impl TypeId {
     const TAG_SHIFT: usize = size_of::<usize>() * 8 - 1;
-    const TAG_MASK:usize = 1 << Self::TAG_SHIFT;
+    const TAG_MASK: usize = 1 << Self::TAG_SHIFT;
+
+    pub const ANY: TypeId = TypeId(usize::MAX);
 
     fn from_raw(v: usize) -> TypeId {
         TypeId(v)
@@ -95,7 +96,7 @@ impl TypeId {
     }
 
     fn is_any(&self) -> bool {
-        self.0 == usize::MAX
+        *self == Self::ANY
     }
 
     fn raw_index(&self) -> usize {
@@ -103,7 +104,7 @@ impl TypeId {
     }
 
     fn index(&self) -> Option<usize> {
-        if self.0 == usize::MAX {
+        if *self == Self::ANY {
             None
         } else {
             Some(self.raw_index())
@@ -136,26 +137,17 @@ impl FnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum UnboxedType {
+enum UnboxedType {}
+
+impl UnboxedType {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeInfo {
     AnyFn,
     Fn(FnType),
     AnyExt,
     Ext(ExtType),
     Tup(Vec<TypeId>),
-}
-
-impl UnboxedType {
-    fn is_extty(&self) -> bool {
-        match self {
-            UnboxedType::AnyExt | UnboxedType::Ext(_) => true,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TypeInfo {
-    Unboxed(UnboxedTypeId),
     Boxed(HashSet<UnboxedTypeId>),
     Any,
 }
@@ -174,96 +166,22 @@ enum ConvFailure {
 }
 
 impl TypeInfo {
+    fn is_extty(&self) -> bool {
+        match self {
+            TypeInfo::AnyExt | TypeInfo::Ext(_) => true,
+            _ => false,
+        }
+    }
+
     fn is_boxed(&self) -> bool {
         match self {
-            TypeInfo::Unboxed(..) => false,
-            _ => true,
+            TypeInfo::Boxed(_) | TypeInfo::Any => true,
+            _ => false,
         }
     }
 
-    fn unboxed_type(&self) -> Option<UnboxedTypeId> {
-        match self {
-            TypeInfo::Unboxed(ut) => Some(*ut),
-            _ => None,
-        }
-    }
-
-    fn merge(&self, other: &TypeInfo) -> TypeInfo {
-        use TypeInfo::*;
-
-        if self == other {
-            return self.clone();
-        }
-
-        match (self, other) {
-            (Any, _) | (_, Any) => Any,
-            (Unboxed(t0), Unboxed(t1)) => Boxed(HashSet::from([t0.clone(), t1.clone()])),
-            (Unboxed(t0), Boxed(ts)) | (Boxed(ts), Unboxed(t0)) => {
-                let mut ts = ts.clone();
-                ts.insert(t0.clone());
-                Boxed(ts)
-            }
-            (Boxed(ts0), Boxed(ts1)) => Boxed(ts0 | ts1),
-        }
-    }
-
-    fn conversion(&self, to: &TypeInfo) -> result::Result<Option<ConvAction>, ConvFailure> {
-        // If the types match, then there's no conversion needed
-        if self == to {
-            return Ok(None);
-        }
-
-        match to {
-            TypeInfo::Boxed(tys) => {
-                match self {
-                    // Can't narrow the type of any
-                    TypeInfo::Any => Err(ConvFailure::TooNarrow(None)),
-                    TypeInfo::Boxed(self_tys) => {
-                        // If we're widening the type then it's a no-op
-                        if tys.is_subset(self_tys) {
-                            Ok(None)
-                        } else {
-                            // If target type is not a super of the current type
-                            // Then we can't convert
-                            Err(ConvFailure::TooNarrow(Some(self_tys - tys)))
-                        }
-                    }
-                    TypeInfo::Unboxed(ub) => {
-                        // Same logic as above, but with a single element instead
-                        if tys.contains(ub) {
-                            Ok(Some(ConvAction::Box))
-                        } else {
-                            Err(ConvFailure::TooNarrow(Some(HashSet::from([*ub]))))
-                        }
-                    }
-                }
-            }
-            TypeInfo::Any => {
-                // Already boxed?
-                if self.is_boxed() {
-                    Ok(None)
-                } else {
-                    // No? Box it!
-                    Ok(Some(ConvAction::Box))
-                }
-            }
-            TypeInfo::Unboxed(ub) => {
-                match self {
-                    // We already checked f or equality, so they must mismatch
-                    TypeInfo::Unboxed(self_ub) => Err(ConvFailure::Mismatch(*self_ub, *ub)),
-                    TypeInfo::Boxed(self_tys) => {
-                        // We're going from a singleton boxed type to the same type unboxed:
-                        if self_tys.len() == 1 && self_tys.contains(ub) {
-                            Ok(Some(ConvAction::Unbox(*ub)))
-                        } else {
-                            Err(ConvFailure::TooNarrow(Some(HashSet::from([*ub]))))
-                        }
-                    }
-                    // Going from Any to anything else is too narrow
-                    TypeInfo::Any => Err(ConvFailure::TooNarrow(None)),
-                }
-            }
-        }
+    fn is_unboxed(&self) -> bool {
+        !self.is_boxed()
     }
 }
 
@@ -288,27 +206,24 @@ impl Metadata {
         }
     }
 
-    fn unboxed(ti: UnboxedTypeId) -> Metadata {
-        Metadata {
-            type_info: TypeInfo::Unboxed(ti),
-            uses_io: false,
-        }
-    }
-
-    fn merge(&self, other: &Self) -> Metadata {
-        let ti = self.type_info.merge(&other.type_info);
+    fn merge(&self, other: &Self, ts: &mut TypeSystem) -> Metadata {
+        let ti = ts.merge(&self.type_info, &other.type_info);
         Metadata {
             uses_io: self.uses_io || other.uses_io,
             type_info: ti,
         }
     }
 
-    fn conversion(&self, to: &Self) -> result::Result<Option<ConvAction>, ConvFailure> {
+    fn conversion(
+        &self,
+        to: &Self,
+        ts: &mut TypeSystem,
+    ) -> result::Result<Option<ConvAction>, ConvFailure> {
         if self.uses_io && !to.uses_io {
             return Err(ConvFailure::CantPurify);
         }
 
-        self.type_info.conversion(&to.type_info)
+        ts.conversion(&self.type_info, &to.type_info)
     }
 }
 
@@ -325,8 +240,7 @@ impl Node {
 }
 
 struct TypeSystem {
-    unboxed_types: Vec<UnboxedType>,
-    boxed_types: Vec<TypeInfo>,
+    types: Vec<TypeInfo>,
     any_extty: TypeId,
     any_fnty: TypeId,
     extty_count: usize,
@@ -340,28 +254,35 @@ impl TypeSystem {
     pub const TYPE_TAG_SHIFT: usize = 16;
 
     fn new() -> TypeSystem {
-        let mut unboxed_types = Vec::new();
+        let mut types = Vec::new();
         let mut descs = Externals::ext_ty_descs();
         // TODO: Doesn't work for custom extty?
         descs.sort_by_key(|d| d.index);
         for ty_desc in descs {
-            unboxed_types.push(UnboxedType::Ext(ExtType {
+            types.push(TypeInfo::Ext(ExtType {
                 id: ty_desc.index as u16,
                 name: ty_desc.name,
             }))
         }
-        let extty_count = unboxed_types.len();
-        let any_extty = TypeId(unboxed_types.len());
-        unboxed_types.push(UnboxedType::AnyExt);
-        let any_fnty = TypeId(unboxed_types.len());
-        unboxed_types.push(UnboxedType::AnyFn);
+        let extty_count = types.len();
+        let any_extty = TypeId(types.len());
+        types.push(TypeInfo::AnyExt);
+        let any_fnty = TypeId(types.len());
+        types.push(TypeInfo::AnyFn);
         TypeSystem {
-            unboxed_types,
-            boxed_types: Vec::new(),
+            types,
             any_extty,
             any_fnty,
             extty_count,
         }
+    }
+
+    fn i32_ty(&self) -> &TypeInfo {
+        self.ty(Self::I32_TY)
+    }
+
+    fn nil_ty(&self) -> &TypeInfo {
+        self.ty(Self::NIL_TY)
     }
 
     fn extty_count(&self) -> usize {
@@ -379,17 +300,28 @@ impl TypeSystem {
     fn extty(&self, ty: ExtTy) -> TypeId {
         let t = TypeId(ty.index());
         debug_assert!(match self.ty(t) {
-            UnboxedType::Ext(ExtType { id: x, .. }) if ty.index() == *x as usize => true,
+            TypeInfo::Ext(ExtType { id: x, .. }) if ty.index() == *x as usize => true,
             _ => false,
         });
         t
     }
 
-    fn ty(&self, ti: TypeId) -> &UnboxedType {
-        &self.types[ti.0]
+    fn uty(&self, ti: UnboxedTypeId) -> &TypeInfo {
+        &self.types[ti.index()]
     }
 
-    fn intern_ty(&mut self, ut: UnboxedType) -> TypeId {
+    fn ty(&self, ti: TypeId) -> &TypeInfo {
+        if let Some(i) = ti.index() {
+            &self.types[i]
+        } else {
+            &TypeInfo::Any
+        }
+    }
+
+    fn intern_ty(&mut self, ut: TypeInfo) -> TypeId {
+        if let TypeInfo::Any = ut {
+            return TypeId::ANY;
+        }
         if let Some(idx) = self.types.iter().rposition(|x| *x == ut) {
             TypeId(idx)
         } else {
@@ -399,14 +331,101 @@ impl TypeSystem {
         }
     }
 
-    fn type_tag(&self, tid: TypeId) -> i32 {
-        use UnboxedType::*;
-        let ty = self.ty(tid);
+    fn type_tag(&self, ty: &TypeInfo) -> i32 {
+        use TypeInfo::*;
         match ty {
             AnyExt | AnyFn => panic!("Type `{:?}` is not taggable!", ty),
             Fn(fty) => self.any_fnty().0 as i32 | (fty.prms.len() as (i32) << Self::TYPE_TAG_SHIFT),
             Ext(ty) => ty.id as i32,
             Tup(_) => todo!("Tuple tagging"),
+            _ => panic!("Tried to tag a boxed type"),
+        }
+    }
+
+    fn merge(&mut self, t0: &TypeInfo, t1: &TypeInfo) -> TypeInfo {
+        use TypeInfo::*;
+
+        if t0 == t1 {
+            return t0.clone();
+        }
+
+        match (t0, t1) {
+            (Any, _) | (_, Any) => Any,
+            (Boxed(ts0), Boxed(ts1)) => Boxed(ts0 | ts1),
+            (t, Boxed(ts)) | (Boxed(ts), t) => {
+                let mut ts = ts.clone();
+                ts.insert(self.intern_ty(t.clone()).as_unboxed().unwrap());
+                Boxed(ts)
+            }
+            (_, _) => Boxed(HashSet::from([
+                self.intern_ty(t0.clone()).as_unboxed().unwrap(),
+                self.intern_ty(t1.clone()).as_unboxed().unwrap(),
+            ])),
+        }
+    }
+
+    fn conversion(
+        &mut self,
+        from: &TypeInfo,
+        to: &TypeInfo,
+    ) -> result::Result<Option<ConvAction>, ConvFailure> {
+        // If the types match, then there's no conversion needed
+        if from == to {
+            return Ok(None);
+        }
+
+        match to {
+            TypeInfo::Any => {
+                // Already boxed?
+                if from.is_boxed() {
+                    Ok(None)
+                } else {
+                    // No? Box it!
+                    Ok(Some(ConvAction::Box))
+                }
+            }
+            TypeInfo::Boxed(tys) => {
+                if from == &TypeInfo::Any {
+                    Err(ConvFailure::TooNarrow(None))
+                } else if let TypeInfo::Boxed(from_tys) = from {
+                    // If we're widening the type then it's a no-op
+                    if tys.is_subset(from_tys) {
+                        Ok(None)
+                    } else {
+                        // If target type is not a super of the current type
+                        // Then we can't convert
+                        Err(ConvFailure::TooNarrow(Some(from_tys - tys)))
+                    }
+                } else {
+                    let tid = self.intern_ty(from.clone()).as_unboxed().unwrap();
+                    // Same logic as above, but with a single element instead
+                    if tys.contains(&tid) {
+                        Ok(Some(ConvAction::Box))
+                    } else {
+                        Err(ConvFailure::TooNarrow(Some(HashSet::from([tid]))))
+                    }
+                }
+            }
+            _ => {
+                let ub = self.intern_ty(to.clone()).as_unboxed().unwrap();
+                match from {
+                    // Going from Any to anything else is too narrow
+                    TypeInfo::Any => Err(ConvFailure::TooNarrow(None)),
+                    TypeInfo::Boxed(from_tys) => {
+                        // We're going from a singleton boxed type to the same type unboxed:
+                        if from_tys.len() == 1 && from_tys.contains(&ub) {
+                            Ok(Some(ConvAction::Unbox(ub)))
+                        } else {
+                            Err(ConvFailure::TooNarrow(Some(HashSet::from([ub]))))
+                        }
+                    }
+                    // We already checked f or equality, so they must mismatch
+                    _ => Err(ConvFailure::Mismatch(
+                        self.intern_ty(from.clone()).as_unboxed().unwrap(),
+                        ub,
+                    )),
+                }
+            }
         }
     }
 }
@@ -442,7 +461,7 @@ impl Compiler {
             ),
         ];
         for (n, i, t) in builtins {
-            let tid = ts.intern_ty(UnboxedType::Fn(t.clone()));
+            let tid = ts.intern_ty(TypeInfo::Fn(t.clone()));
             scope.define(
                 n.to_string(),
                 Entry::Builtin(BuiltinEntry::new(n.to_string(), i, t, tid)),
@@ -511,10 +530,9 @@ impl Compiler {
     }
 
     fn box_node(&mut self, n: Node) -> Hir {
-        let tid = n.meta.type_info.unboxed_type().unwrap();
         Hir::Tup(vec![
             // TODO: Use a value that is stable between Compiler instances
-            Hir::I32(self.type_system.type_tag(tid)),
+            Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
             n.hir,
         ])
     }
@@ -537,7 +555,7 @@ impl Compiler {
     }
 
     fn convert(&mut self, n: Node, to: &Metadata) -> Result<Hir> {
-        match n.meta.conversion(&to) {
+        match n.meta.conversion(&to, &mut self.type_system) {
             Err(err) => self.conv_failed(&n.meta, to, err),
             Ok(None) => Ok(n.hir),
             Ok(Some(ca)) => Ok(self.perform_conv_action(ca, n)),
@@ -592,9 +610,15 @@ impl Compiler {
                             let ret = ty.ret;
                             let mut args = Vec::new();
                             for (e, prm) in es.into_iter().zip(ty.prms.clone().iter()) {
-                                args.push(self.conv_expr(e, &Metadata::unboxed(*prm))?);
+                                args.push(self.conv_expr(
+                                    e,
+                                    &Metadata::pure(self.type_system.ty(*prm).clone()),
+                                )?);
                             }
-                            return Ok(Node::new(Hir::ExtCall(id, args), Metadata::unboxed(ret)));
+                            return Ok(Node::new(
+                                Hir::ExtCall(id, args),
+                                Metadata::pure(self.type_system.ty(ret).clone()),
+                            ));
                         }
                         _ => {}
                     }
@@ -614,8 +638,18 @@ impl Compiler {
                 // TODO: Flow typing
                 let cond = self.expr(*e0)?;
                 let cond_val = match cond.meta.type_info {
-                    TypeInfo::Unboxed(t) => {
-                        let ty = self.type_system.ty(t);
+                    TypeInfo::Boxed(ts) => {
+                        // Same idea as above
+                        if ts.iter().all(|t| !self.type_system.uty(*t).is_extty()) {
+                            return self.expr(*e1);
+                        }
+                        // Otherwise we actually have to inspect the box type
+                        // to safely construct a thruthy value
+                        self.truth_of_expr(cond.hir, Some(ts))?
+                    }
+                    TypeInfo::Any => self.truth_of_expr(cond.hir, None)?,
+                    ty => {
+                        debug_assert!(ty.is_unboxed());
                         if !ty.is_extty() {
                             // We can't directly pass a tuple/fn to an `if`
                             // But they're always considered truthy anyway
@@ -624,20 +658,10 @@ impl Compiler {
                         }
                         cond.hir
                     }
-                    TypeInfo::Boxed(ts) => {
-                        // Same idea as above
-                        if ts.iter().all(|t| !self.type_system.ty(*t).is_extty()) {
-                            return self.expr(*e1);
-                        }
-                        // Otherwise we actually have to inspect the box type
-                        // to safely construct a thruthy value
-                        self.truth_of_expr(cond.hir, Some(ts))?
-                    }
-                    TypeInfo::Any => self.truth_of_expr(cond.hir, None)?,
                 };
                 let b_then = self.expr(*e1)?;
                 let b_else = self.expr(*e2)?;
-                let meta = b_then.meta.merge(&b_else.meta);
+                let meta = b_then.meta.merge(&b_else.meta, &mut self.type_system);
                 Ok(Node {
                     hir: Hir::If(
                         Box::new(cond_val),
@@ -651,6 +675,7 @@ impl Compiler {
                 // TODO: IO Sequencing
                 self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))
             }
+            /*
             Expr::Fn(ps, mut es) => {
                 for p in &ps {
                     let name = self.gen(p.clone());
@@ -687,16 +712,18 @@ impl Compiler {
                     uses_io: ret_meta.uses_io,
                 })
             }
+            */
             Expr::Lit(l) => self.lit(l),
+            _ => todo!(),
         }
     }
 
-    fn truth_of_expr(&mut self, e: Hir, tys: Option<HashSet<TypeId>>) -> Result<Hir> {
+    fn truth_of_expr(&mut self, e: Hir, tys: Option<HashSet<UnboxedTypeId>>) -> Result<Hir> {
         // If all the possibly values `e` can be are all exttys then we can safely
         // pass it unboxed
         if tys
             .as_ref()
-            .map(|tys| tys.iter().all(|t| self.type_system.ty(*t).is_extty()))
+            .map(|tys| tys.iter().all(|t| self.type_system.uty(*t).is_extty()))
             .unwrap_or(false)
         {
             return Ok(self.unbox_node(e));
@@ -754,7 +781,7 @@ impl Compiler {
 
                 Ok(Node::new(
                     Hir::CurryLam(names, Box::new(Hir::ExtCall(ext, args))),
-                    Metadata::unboxed(fn_ty),
+                    Metadata::pure(self.type_system.ty(fn_ty).clone()),
                 ))
             }
             None => self.undefined_var(&x),
@@ -767,18 +794,21 @@ impl Compiler {
                 // TODO: We can technically fit 45bit integers
                 Ok(Node::new(
                     Hir::I32(n as i32),
-                    Metadata::unboxed(TypeSystem::I32_TY),
+                    Metadata::pure(self.type_system.i32_ty().clone()),
                 ))
             }
             Literal::Num(n) => self.literal_out_of_range(n),
-            Literal::Nil => Ok(Node::new(Hir::Nil, Metadata::unboxed(TypeSystem::NIL_TY))),
+            Literal::Nil => Ok(Node::new(
+                Hir::Nil,
+                Metadata::pure(self.type_system.nil_ty().clone()),
+            )),
             Literal::True => Ok(Node::new(
                 Hir::I32(1),
-                Metadata::unboxed(TypeSystem::I32_TY),
+                Metadata::pure(self.type_system.i32_ty().clone()),
             )),
             Literal::False => Ok(Node::new(
                 Hir::I32(0),
-                Metadata::unboxed(TypeSystem::I32_TY),
+                Metadata::pure(self.type_system.i32_ty().clone()),
             )),
             Literal::Keyword(_) => todo!("keywords"),
             Literal::Symbol(_) => todo!("symbols"),
@@ -808,14 +838,15 @@ mod tests {
 
     #[test]
     fn basics() {
-        let i32md = Metadata::unboxed(TypeSystem::I32_TY);
-        let nilmd = Metadata::unboxed(TypeSystem::NIL_TY);
-
         let mut compiler = Compiler::new();
-        let arith_fn_ty = compiler.type_system.intern_ty(UnboxedType::Fn(FnType::new(
+
+        let i32md = Metadata::pure(compiler.type_system.i32_ty().clone());
+        let nilmd = Metadata::pure(compiler.type_system.nil_ty().clone());
+
+        let arith_fn_ty = TypeInfo::Fn(FnType::new(
             TypeSystem::I32_TY,
             vec![TypeSystem::I32_TY, TypeSystem::I32_TY],
-        )));
+        ));
 
         let mut c = |src| compiler.expr(Expr::parse(&read(src).unwrap()).unwrap());
 
@@ -856,7 +887,7 @@ mod tests {
                         ]
                     ))
                 ),
-                Metadata::unboxed(arith_fn_ty)
+                Metadata::pure(arith_fn_ty)
             ))
         );
         assert!(c("(@i32add true nil)").is_err());
