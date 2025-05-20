@@ -449,6 +449,7 @@ impl ExtTyDesc {
 }
 
 #[repr(transparent)]
+#[derive(PartialEq, Eq)]
 pub struct ExtVal<'h>(*mut (), PhantomData<&'h ()>);
 
 // SAFETY: ExtVal is effective a enum { Imm(u32), Cell(SharedCell) }
@@ -746,6 +747,9 @@ impl Externals {
     pub const ARGS_PUSH: u16 = 6;
     pub const ARR_SET: u16 = 7;
     pub const I32_LT: u16 = 8;
+    pub const I32_AND: u16 = 9;
+    pub const EQ: u16 = 10;
+    pub const I32_SHR: u16 = 11;
 
     pub fn ext_ty_descs() -> Vec<ExtTyDesc> {
         vec![
@@ -852,8 +856,20 @@ impl Externals {
                 assert_eq!(x.ty(), Self::I32_TY);
                 assert_eq!(y.ty(), Self::I32_TY);
                 ExtVal::i32(if x.get_i32() < y.get_i32() { 1 } else { 0 })
+            },
+            I32_AND: |_rt, x, y| {
+                assert_eq!(x.ty(), Self::I32_TY);
+                assert_eq!(y.ty(), Self::I32_TY);
+                ExtVal::i32(x.get_i32() & y.get_i32())
+            },
+            EQ: |_rt, x, y| {
+                ExtVal::i32(if x == y { 1 } else { 0 })
+            },
+            I32_SHR: |_rt, x, y| {
+                assert_eq!(x.ty(), Self::I32_TY);
+                assert_eq!(y.ty(), Self::I32_TY);
+                ExtVal::i32(x.get_i32() >> y.get_i32())
             }
-
         );
 
         Externals {

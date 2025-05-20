@@ -192,6 +192,13 @@ struct Metadata {
 }
 
 impl Metadata {
+    fn new(ty: TypeInfo, io: bool) -> Metadata {
+        Metadata {
+            type_info: ty,
+            uses_io: io,
+        }
+    }
+
     fn any_io() -> Metadata {
         Metadata {
             type_info: TypeInfo::Any,
@@ -331,11 +338,15 @@ impl TypeSystem {
         }
     }
 
+    fn any_fn_tag(&self, arity: usize) -> i32 {
+        self.any_fnty().0 as i32 | (arity as (i32) << Self::TYPE_TAG_SHIFT)
+    }
+
     fn type_tag(&self, ty: &TypeInfo) -> i32 {
         use TypeInfo::*;
         match ty {
             AnyExt | AnyFn => panic!("Type `{:?}` is not taggable!", ty),
-            Fn(fty) => self.any_fnty().0 as i32 | (fty.prms.len() as (i32) << Self::TYPE_TAG_SHIFT),
+            Fn(fty) => self.any_fn_tag(fty.prms.len()),
             Ext(ty) => ty.id as i32,
             Tup(_) => todo!("Tuple tagging"),
             _ => panic!("Tried to tag a boxed type"),
@@ -475,6 +486,10 @@ impl Compiler {
         }
     }
 
+    fn reset(&mut self) {
+        self.next_name_id = 1;
+    }
+
     fn gen(&mut self, x: impl ToString) -> Name {
         let i = self.next_name_id;
         self.next_name_id += 1;
@@ -491,10 +506,15 @@ impl Compiler {
         Err(format!("Undefined variable: `{}`", x))
     }
 
-    fn invalid_arity<T>(&self, f: &str, got: usize, exp: usize) -> Result<T> {
+    fn invalid_arity<T>(&self, f: Option<&str>, got: usize, exp: usize) -> Result<T> {
+        let f_msg = if let Some(name) = f {
+            format!("`{}`", name)
+        } else {
+            "Function".to_string()
+        };
         Err(format!(
-            "`{}` is being called with the wrong number of arguments. Expected {}, got {}",
-            f, exp, got
+            "{} is being called with the wrong number of arguments. Expected {}, got {}",
+            f_msg, exp, got
         ))
     }
 
@@ -527,6 +547,10 @@ impl Compiler {
             "Failed to convert from {:?} to {:?}: {}",
             from, to, reason
         ))
+    }
+
+    fn uninvokable_value<T>(&self, ty: &TypeInfo) -> Result<T> {
+        Err(format!("Can't invoke value of type `{:?}`", ty))
     }
 
     fn box_node(&mut self, n: Node) -> Hir {
@@ -605,7 +629,7 @@ impl Compiler {
                             let arity = *arity;
                             let id = *extcall_id;
                             if arity != es.len() {
-                                return self.invalid_arity(head, es.len(), arity);
+                                return self.invalid_arity(Some(head), es.len(), arity);
                             }
                             let ret = ty.ret;
                             let mut args = Vec::new();
@@ -623,15 +647,91 @@ impl Compiler {
                         _ => {}
                     }
                 }
-                Ok(Node::new(
-                    Hir::CurryCall(
-                        Box::new(self.conv_expr(*f, &Metadata::any_io())?),
-                        es.into_iter()
-                            .map(|e| self.conv_expr(e, &Metadata::any_io()))
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
-                    Metadata::any_io(),
-                ))
+                let Node {
+                    hir: head,
+                    meta: head_meta,
+                } = self.expr(*f)?;
+
+                // TODO: IO sequencing
+                let (mut args, ret_ty) = match &head_meta.type_info {
+                    // We have a concrete function type?
+                    TypeInfo::Fn(fn_ty) => {
+                        if fn_ty.prms.len() == es.len() {
+                            (
+                                es.into_iter()
+                                    .zip(fn_ty.prms.iter())
+                                    .map(|(e, ti)| {
+                                        self.conv_expr(
+                                            e,
+                                            &Metadata::pure(self.type_system.ty(*ti).clone()),
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>>>()?,
+                                self.type_system.ty(fn_ty.ret).clone(),
+                            )
+                        } else {
+                            return self.invalid_arity(None, fn_ty.prms.len(), es.len());
+                        }
+                    }
+                    TypeInfo::Any | TypeInfo::Boxed(_) => {
+                        // TODO: In theory we can get more specific based on the types in `Boxed(..)`
+                        (
+                            es.into_iter()
+                                .map(|e| self.conv_expr(e, &Metadata::any_io()))
+                                .collect::<Result<Vec<_>>>()?,
+                            TypeInfo::Any,
+                        )
+                    }
+                    TypeInfo::AnyFn => panic!("ICE: AnyFn in unboxed head position of invoke"),
+                    t => {
+                        return self.uninvokable_value(&t);
+                    }
+                };
+
+                let arg_count = args.len();
+                let args = if args.len() == 0 {
+                    Hir::Nil
+                } else if args.len() == 1 {
+                    args.pop().unwrap()
+                } else {
+                    Hir::Tup(args)
+                };
+
+                let result = if head_meta.type_info.is_boxed() {
+                    let head_ty = self.gen("__box_ty");
+                    let head_val = self.gen("__box_val");
+                    // let (__box_ty, __box_val) = head
+                    // if __box_ty == ANY_FN_ARITY#arg_count
+                    // then __box_val ..args
+                    // else nil ; ERROR
+                    Hir::Untup(
+                        vec![head_ty.clone(), head_val.clone()],
+                        Box::new(head),
+                        Box::new(Hir::If(
+                            Box::new(Hir::ExtCall(
+                                Externals::EQ,
+                                vec![
+                                    Hir::Var(head_ty),
+                                    Hir::I32(self.type_system.any_fn_tag(arg_count)),
+                                ],
+                            )),
+                            Box::new(Hir::Call(
+                                Box::new(Hir::Var(head_val)),
+                                Box::new(args),
+                            )),
+                            // TODO: Proper errors
+                            Box::new(Hir::Nil),
+                        )),
+                    )
+                } else {
+                    // We checked for non-fn unboxed types earlier, so we know it's a fn type here:
+                    Hir::Call(Box::new(head), Box::new(args))
+                };
+
+                Ok(Node {
+                    hir: result,
+                    meta: Metadata::pure(ret_ty),
+                })
             }
             Expr::If(e0, e1, e2) => {
                 // TODO: IO sequencing
@@ -675,8 +775,8 @@ impl Compiler {
                 // TODO: IO Sequencing
                 self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))
             }
-            /*
             Expr::Fn(ps, mut es) => {
+                let arity = ps.len();
                 for p in &ps {
                     let name = self.gen(p.clone());
                     self.scope.define(
@@ -687,16 +787,18 @@ impl Compiler {
                         }),
                     );
                 }
-                let Node{ hir: body, meta: ret_meta } = self.conv_expr(
-                    es.pop().unwrap_or(Expr::Lit(Literal::Nil)),
-                    &Metadata::any_io(),
-                )?;
-                let (prms_var, body) = if ps.len() == 1 {
+                let Node {
+                    hir: body,
+                    meta: ret_meta,
+                } = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
+                let (prms_var, body) = if ps.len() == 0 {
+                    (self.gen("__dummy_prm"), body)
+                } else if ps.len() == 1 {
                     (self.scope.undefine(&ps[0]).name(), body)
                 } else {
                     let prms_var = self.gen("__prms");
                     (
-                        prms_var,
+                        prms_var.clone(),
                         Hir::Untup(
                             ps.into_iter()
                                 .map(|p| self.scope.undefine(&p).name())
@@ -706,13 +808,15 @@ impl Compiler {
                         ),
                     )
                 };
-                let ret_ty = self.type_system.ty(ret_meta.type_info);
-                Node::new(Hir::Lam(prms_var, Box::new(body)), Metadata {
-                    type_info: TypeInfo::Unboxed(UnboxedType::Fn(ret_ty))
-                    uses_io: ret_meta.uses_io,
-                })
+                let fn_ty = TypeInfo::Fn(FnType {
+                    prms: vec![TypeId::ANY; arity],
+                    ret: self.type_system.intern_ty(ret_meta.type_info),
+                });
+                Ok(Node::new(
+                    Hir::Lam(prms_var, Box::new(body)),
+                    Metadata::new(fn_ty, ret_meta.uses_io),
+                ))
             }
-            */
             Expr::Lit(l) => self.lit(l),
             _ => todo!(),
         }
@@ -848,7 +952,11 @@ mod tests {
             vec![TypeSystem::I32_TY, TypeSystem::I32_TY],
         ));
 
-        let mut c = |src| compiler.expr(Expr::parse(&read(src).unwrap()).unwrap());
+        let any0_nil_fn_ty = TypeInfo::Fn(FnType::new(TypeSystem::NIL_TY, vec![]));
+        let any1_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY]));
+        let any2_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY, TypeId::ANY]));
+
+        let mut c = |src| { compiler.reset(); compiler.expr(Expr::parse(&read(src).unwrap()).unwrap()) };
 
         assert_eq!(c("true"), Ok(Node::new(Hir::I32(1), i32md.clone())));
         assert_eq!(c("false"), Ok(Node::new(Hir::I32(0), i32md.clone())));
@@ -891,6 +999,37 @@ mod tests {
             ))
         );
         assert!(c("(@i32add true nil)").is_err());
+        assert_eq!(
+            c("(fn [] nil)"),
+            Ok(Node::new(
+                Hir::Lam(Name::new("__dummy_prm", 1), Box::new(Hir::Nil)),
+                Metadata::pure(any0_nil_fn_ty)
+            ))
+        );
+        assert_eq!(
+            c("(fn [x] x)"),
+            Ok(Node::new(
+                Hir::Lam(
+                    Name::new("x", 1),
+                    Box::new(Hir::Var(Name::new("x", 1)))
+                ),
+                Metadata::pure(any1_fn_ty)
+            ))
+        );
+        assert_eq!(
+            c("(fn [x y] x)"),
+            Ok(Node::new(
+                Hir::Lam(
+                    Name::new("__prms", 3),
+                    Box::new(Hir::Untup(
+                        vec![Name::new("x", 1), Name::new("y", 2)],
+                        Box::new(Hir::Var(Name::new("__prms", 3))),
+                        Box::new(Hir::Var(Name::new("x", 1)))
+                    ))
+                ),
+                Metadata::pure(any2_fn_ty)
+            ))
+        );
     }
 
     #[test]
@@ -935,6 +1074,15 @@ mod tests {
             ("(do 0 1 2 3)", ExtVal::i32(3)),
             ("(do 0)", ExtVal::i32(0)),
             ("(do)", ExtVal::nil()),
+            ("((fn [] 1))", ExtVal::i32(1)),
+            ("((fn [x] x) 1)", ExtVal::i32(1)),
+            ("((fn [x y] y) 1 2)", ExtVal::i32(2)),
+            ("(let [f (fn [x y] y)] (f 1 2))", ExtVal::i32(2)),
+            (
+                "(let [id (fn [x] x) f (fn [x y] y)] ((id f) 1 2))",
+                ExtVal::i32(2),
+            ),
+            ("((if true (fn [] 0) (fn [] nil)))", ExtVal::i32(0)),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
