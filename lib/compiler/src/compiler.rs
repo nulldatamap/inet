@@ -554,11 +554,37 @@ impl Compiler {
     }
 
     fn box_node(&mut self, n: Node) -> Hir {
-        Hir::Tup(vec![
-            // TODO: Use a value that is stable between Compiler instances
-            Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
-            n.hir,
-        ])
+        match &n.meta.type_info {
+            // TODO: In theory, we should also just make a version of the function
+            //       That returns a box on its own instead of wrapping the function
+            TypeInfo::Fn(FnType { ret, .. }) if !ret.is_box() => {
+                // (ANY_FN_ARITY#N, (fn [__prms] (RET_TY, (val __prms))))
+                let prms = self.gen("__prms");
+                Hir::Tup(vec![
+                    Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
+                    Hir::Lam(
+                        prms.clone(),
+                        Box::new(Hir::Tup(vec![
+                            Hir::I32(self.type_system.type_tag(self.type_system.ty(*ret))),
+                            Hir::Call(Box::new(n.hir), Box::new(Hir::Var(prms))),
+                        ])),
+                    ),
+                ])
+            }
+            TypeInfo::Any | TypeInfo::Boxed(_) => {
+                panic!("Tried to box an already boxed node: {:?}", n)
+            }
+            TypeInfo::AnyExt | TypeInfo::AnyFn => {
+                panic!("Tried to box a type-erased node: {:?}", n)
+            }
+            _ => {
+                Hir::Tup(vec![
+                    // TODO: Use a value that is stable between Compiler instances
+                    Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
+                    n.hir,
+                ])
+            }
+        }
     }
 
     fn unbox_node(&mut self, v: Hir) -> Hir {
@@ -670,7 +696,7 @@ impl Compiler {
                                 self.type_system.ty(fn_ty.ret).clone(),
                             )
                         } else {
-                            return self.invalid_arity(None, fn_ty.prms.len(), es.len());
+                            return self.invalid_arity(None,  es.len(), fn_ty.prms.len());
                         }
                     }
                     TypeInfo::Any | TypeInfo::Boxed(_) => {
@@ -715,10 +741,7 @@ impl Compiler {
                                     Hir::I32(self.type_system.any_fn_tag(arg_count)),
                                 ],
                             )),
-                            Box::new(Hir::Call(
-                                Box::new(Hir::Var(head_val)),
-                                Box::new(args),
-                            )),
+                            Box::new(Hir::Call(Box::new(Hir::Var(head_val)), Box::new(args))),
                             // TODO: Proper errors
                             Box::new(Hir::Nil),
                         )),
@@ -956,7 +979,10 @@ mod tests {
         let any1_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY]));
         let any2_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY, TypeId::ANY]));
 
-        let mut c = |src| { compiler.reset(); compiler.expr(Expr::parse(&read(src).unwrap()).unwrap()) };
+        let mut c = |src| {
+            compiler.reset();
+            compiler.expr(Expr::parse(&read(src).unwrap()).unwrap())
+        };
 
         assert_eq!(c("true"), Ok(Node::new(Hir::I32(1), i32md.clone())));
         assert_eq!(c("false"), Ok(Node::new(Hir::I32(0), i32md.clone())));
@@ -1009,10 +1035,7 @@ mod tests {
         assert_eq!(
             c("(fn [x] x)"),
             Ok(Node::new(
-                Hir::Lam(
-                    Name::new("x", 1),
-                    Box::new(Hir::Var(Name::new("x", 1)))
-                ),
+                Hir::Lam(Name::new("x", 1), Box::new(Hir::Var(Name::new("x", 1)))),
                 Metadata::pure(any1_fn_ty)
             ))
         );
@@ -1030,7 +1053,6 @@ mod tests {
                 Metadata::pure(any2_fn_ty)
             ))
         );
-        assert_eq!(c("((if true (fn [] nil) (fn [] 0)))"), Err("wow".to_string()));
     }
 
     #[test]
@@ -1040,7 +1062,7 @@ mod tests {
         fn get_test_result() -> ExtVal<'static> {
             let mut result = TEST_RESULT.lock().unwrap();
             let (cnt, res) = std::mem::replace(&mut *result, (0, ExtVal::nil()));
-            if cnt < 0 {
+            if cnt == 0 {
                 panic!("No test result was set!");
             } else if cnt > 1 {
                 panic!("Multiple ({}) test results were set!", cnt)
@@ -1091,7 +1113,11 @@ mod tests {
                 ExtVal::i32(2),
             ),
             ("((if true (fn [] 0) (fn [] nil)))", ExtVal::i32(0)),
-            ("((if false (fn [] 0) (fn [] nil)))", ExtVal::nil()),
+            // TOOD: Fix once error handling has been addded
+            ("(let [too-many (fn [] 1)] (too-many 1 2 3))", ExtVal::nil()),
+            ("(let [too-few (fn [x y z] 99)] (too-few))", ExtVal::nil()),
+            ("(let [not-a-fn 3] (not-a-fn))", ExtVal::nil()),
+            ("(let [x ((if false (fn [] 0) (fn [] (fn [] 7))))] (if x (x) 0))", ExtVal::i32(7)),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
