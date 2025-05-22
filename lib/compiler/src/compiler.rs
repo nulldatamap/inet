@@ -696,7 +696,7 @@ impl Compiler {
                                 self.type_system.ty(fn_ty.ret).clone(),
                             )
                         } else {
-                            return self.invalid_arity(None,  es.len(), fn_ty.prms.len());
+                            return self.invalid_arity(None, es.len(), fn_ty.prms.len());
                         }
                     }
                     TypeInfo::Any | TypeInfo::Boxed(_) => {
@@ -724,12 +724,13 @@ impl Compiler {
                 };
 
                 let result = if head_meta.type_info.is_boxed() {
+                    let err = self.throw(Expr::Lit(Literal::Nil))?;
                     let head_ty = self.gen("__box_ty");
                     let head_val = self.gen("__box_val");
                     // let (__box_ty, __box_val) = head
                     // if __box_ty == ANY_FN_ARITY#arg_count
                     // then __box_val ..args
-                    // else nil ; ERROR
+                    // else throw nil ; ERROR
                     Hir::Untup(
                         vec![head_ty.clone(), head_val.clone()],
                         Box::new(head),
@@ -743,7 +744,7 @@ impl Compiler {
                             )),
                             Box::new(Hir::Call(Box::new(Hir::Var(head_val)), Box::new(args))),
                             // TODO: Proper errors
-                            Box::new(Hir::Nil),
+                            Box::new(err.hir),
                         )),
                     )
                 } else {
@@ -941,6 +942,14 @@ impl Compiler {
             Literal::Symbol(_) => todo!("symbols"),
         }
     }
+
+    fn throw(&mut self, e: Expr) -> Result<Node> {
+        let div = self.expr(e)?;
+        Ok(Node::new(
+            Hir::Diverge(Box::new(div.hir)),
+            Metadata::any_io(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1057,17 +1066,34 @@ mod tests {
 
     #[test]
     fn eval() {
-        static TEST_RESULT: Mutex<(usize, ExtVal<'static>)> = Mutex::new((0, ExtVal::nil()));
+        #[derive(Default)]
+        struct TestResult {
+            result: Option<ExtVal<'static>>,
+            diverged: Option<ExtVal<'static>>,
+        }
 
-        fn get_test_result() -> ExtVal<'static> {
-            let mut result = TEST_RESULT.lock().unwrap();
-            let (cnt, res) = std::mem::replace(&mut *result, (0, ExtVal::nil()));
-            if cnt == 0 {
-                panic!("No test result was set!");
-            } else if cnt > 1 {
-                panic!("Multiple ({}) test results were set!", cnt)
+        impl TestResult {
+            const fn new() -> TestResult {
+                TestResult {
+                    result: None,
+                    diverged: None,
+                }
             }
-            res
+        }
+
+        static TEST_RESULT: Mutex<TestResult> = Mutex::new(TestResult::new());
+
+        fn get_test_result() -> result::Result<ExtVal<'static>, ExtVal<'static>> {
+            let mut result = TEST_RESULT.lock().unwrap();
+            let TestResult { result, diverged } =
+                std::mem::replace(&mut *result, TestResult::new());
+            match (result, diverged) {
+                (Some(_), Some(_)) => panic!("Test both had a result and diverged(??)"),
+                // TODO: (None, None) => panic!("Test both had no result, but didn't diverge(??)"),
+                (None, None) => Err(ExtVal::nil()),
+                (Some(x), _) => Ok(x),
+                (_, Some(x)) => Err(x),
+            }
         }
 
         let h = Heap::new(NonZeroUsize::new(4096).unwrap());
@@ -1075,49 +1101,60 @@ mod tests {
         let ext_store_test_result = exts.extfns.len() as u16;
         exts.extfns.push(|rt, x, y| {
             let mut test_result = TEST_RESULT.lock().unwrap();
-            rt.erase(std::mem::replace(
-                &mut test_result.1,
-                ExtVal::imm(x.ty(), x.get_imm::<u32>()),
-            ));
-            test_result.0 += 1;
+            let v = ExtVal::imm(x.ty(), x.get_imm::<u32>());
+            if let Some(x) = test_result.result.replace(v) {
+                rt.erase(x);
+                panic!("Test had multiple results!");
+            }
             y
         });
         let mut rt = Rt::new(&h, exts);
 
         let cases = [
-            ("3", ExtVal::i32(3)),
-            ("(@i32add 1 3)", ExtVal::i32(4)),
-            ("(@i32add (@i32add 0 1) (@i32add 2 3))", ExtVal::i32(6)),
-            ("(let [x 9 y x] y)", ExtVal::i32(9)),
-            ("(let [x (@i32add 1 1) y x] y)", ExtVal::i32(2)),
-            ("(let [x 1] (let [x x] x))", ExtVal::i32(1)),
-            ("(if true 1 0)", ExtVal::i32(1)),
-            ("(if false 1 0)", ExtVal::i32(0)),
-            ("(if (@i32add 1 0) 1 0)", ExtVal::i32(1)),
-            ("(if (@i32add 0 0) 1 0)", ExtVal::i32(0)),
-            ("(if nil nil 0)", ExtVal::i32(0)),
-            ("(if nil 0 nil)", ExtVal::nil()),
-            ("(if (if true true false) 1 0)", ExtVal::i32(1)),
-            ("(if (if true nil 1) 1 0)", ExtVal::i32(0)),
-            ("(if (if false nil 1) 1 0)", ExtVal::i32(1)),
-            ("(let [x 3] (if x 1 0))", ExtVal::i32(1)),
-            ("(do 0 1 2 3)", ExtVal::i32(3)),
-            ("(do 0)", ExtVal::i32(0)),
-            ("(do)", ExtVal::nil()),
-            ("((fn [] 1))", ExtVal::i32(1)),
-            ("((fn [x] x) 1)", ExtVal::i32(1)),
-            ("((fn [x y] y) 1 2)", ExtVal::i32(2)),
-            ("(let [f (fn [x y] y)] (f 1 2))", ExtVal::i32(2)),
+            ("3", Ok(ExtVal::i32(3))),
+            ("(@i32add 1 3)", Ok(ExtVal::i32(4))),
+            ("(@i32add (@i32add 0 1) (@i32add 2 3))", Ok(ExtVal::i32(6))),
+            ("(let [x 9 y x] y)", Ok(ExtVal::i32(9))),
+            ("(let [x (@i32add 1 1) y x] y)", Ok(ExtVal::i32(2))),
+            ("(let [x 1] (let [x x] x))", Ok(ExtVal::i32(1))),
+            ("(if true 1 0)", Ok(ExtVal::i32(1))),
+            ("(if false 1 0)", Ok(ExtVal::i32(0))),
+            ("(if (@i32add 1 0) 1 0)", Ok(ExtVal::i32(1))),
+            ("(if (@i32add 0 0) 1 0)", Ok(ExtVal::i32(0))),
+            ("(if nil nil 0)", Ok(ExtVal::i32(0))),
+            ("(if nil 0 nil)", Ok(ExtVal::nil())),
+            ("(if (if true true false) 1 0)", Ok(ExtVal::i32(1))),
+            ("(if (if true nil 1) 1 0)", Ok(ExtVal::i32(0))),
+            ("(if (if false nil 1) 1 0)", Ok(ExtVal::i32(1))),
+            ("(let [x 3] (if x 1 0))", Ok(ExtVal::i32(1))),
+            ("(do 0 1 2 3)", Ok(ExtVal::i32(3))),
+            ("(do 0)", Ok(ExtVal::i32(0))),
+            ("(do)", Ok(ExtVal::nil())),
+            ("((fn [] 1))", Ok(ExtVal::i32(1))),
+            ("((fn [x] x) 1)", Ok(ExtVal::i32(1))),
+            ("((fn [x y] y) 1 2)", Ok(ExtVal::i32(2))),
+            ("(let [f (fn [x y] y)] (f 1 2))", Ok(ExtVal::i32(2))),
             (
                 "(let [id (fn [x] x) f (fn [x y] y)] ((id f) 1 2))",
-                ExtVal::i32(2),
+                Ok(ExtVal::i32(2)),
             ),
-            ("((if true (fn [] 0) (fn [] nil)))", ExtVal::i32(0)),
+            ("((if true (fn [] 0) (fn [] nil)))", Ok(ExtVal::i32(0))),
             // TOOD: Fix once error handling has been addded
-            ("(let [too-many (fn [] 1)] (too-many 1 2 3))", ExtVal::nil()),
-            ("(let [too-few (fn [x y z] 99)] (too-few))", ExtVal::nil()),
-            ("(let [not-a-fn 3] (not-a-fn))", ExtVal::nil()),
-            ("(let [x ((if false (fn [] 0) (fn [] (fn [] 7))))] (if x (x) 0))", ExtVal::i32(7)),
+            (
+                "(let [too-many (fn [] 1)] (too-many 1 2 3))",
+                Err(ExtVal::nil()),
+            ),
+            (
+                "(let [too-few (fn [x y z] 99)] (too-few))",
+                Err(ExtVal::nil()),
+            ),
+            ("(let [not-a-fn 3] (not-a-fn))", Err(ExtVal::nil())),
+            (
+                "(let [x ((if false (fn [] 0) (fn [] (fn [] 7))))] (if x (x) 0))",
+                Ok(ExtVal::i32(7)),
+            ),
+            ("(let [f (fn []) diverge! (fn [] (f 0))] (if true (diverge!) 1))", Err(ExtVal::nil())),
+            ("(let [f (fn []) diverge! (fn [] (f 0))] (if false (diverge!) 1))", Ok(ExtVal::i32(1))),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
@@ -1136,9 +1173,14 @@ mod tests {
                 Port::from_extval(ExtVal::nil()),
             );
             rt.normalize();
-            let result = get_test_result();
-            assert_eq!(result.ty(), expected_val.ty());
-            assert_eq!(result.get_imm::<u32>(), expected_val.get_imm::<u32>());
+            match (expected_val, get_test_result()) {
+                (Ok(e), Ok(g)) | (Err(e), Err(g)) => {
+                    assert_eq!(g.ty(), e.ty());
+                    assert_eq!(g.get_imm::<u32>(), e.get_imm::<u32>());
+                }
+                (Ok(_), _) => panic!("Expected a result, but test diverged"),
+                (Err(_), _) => panic!("Expected test to diverge"),
+            }
         }
     }
 }

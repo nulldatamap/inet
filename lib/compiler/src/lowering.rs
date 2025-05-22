@@ -30,6 +30,7 @@ pub enum Hir {
     Tup(Vec<Hir>),
     Untup(Vec<Name>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
+    Diverge(Box<Hir>),
     Lift(Box<Hir>),
     Lower(Box<Hir>),
 }
@@ -443,6 +444,11 @@ impl LowerSt {
                 let r_in = self.gen_expr(*e0)?;
                 let r_out = self.gen_expr(*e1)?;
                 self.refv(r_in, r_out, r);
+            }
+            Diverge(e) => {
+                let r_div = self.gen_expr(*e)?;
+                self.nil(r_div);
+                self.erase(r);
             }
             Lift(expr) => todo!(),
             Lower(expr) => todo!(),
