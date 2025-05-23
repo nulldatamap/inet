@@ -1,18 +1,20 @@
-use std::{
-    collections::HashSet,
-    num::NonZeroUsize,
-};
+use std::{collections::HashSet, num::NonZeroUsize};
 
 use vm::{
     ext::{ExtVal, Externals},
     program::*,
-    repr::{CombLabel, OperatorLabel, Tag, Port},
+    repr::{CombLabel, OperatorLabel, Port, Tag},
 };
 
 use crate::scope::Name;
 
 type UInst = UnlinkedInst;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameOrRef {
+    Name(Name),
+    Ref(Name, Name),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hir {
@@ -23,12 +25,12 @@ pub enum Hir {
     If(Box<Hir>, Box<Hir>, Box<Hir>),
     Let(Name, Box<Hir>, Box<Hir>),
     Call(Box<Hir>, Box<Hir>),
-    Lam(Name, Box<Hir>),
+    Lam(NameOrRef, Box<Hir>),
     CurryCall(Box<Hir>, Vec<Hir>),
     CurryLam(Vec<Name>, Box<Hir>),
     Ref(Box<Hir>, Box<Hir>),
     Tup(Vec<Hir>),
-    Untup(Vec<Name>, Box<Hir>, Box<Hir>),
+    Untup(Vec<NameOrRef>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
     Diverge(Box<Hir>),
     Lift(Box<Hir>),
@@ -64,7 +66,7 @@ pub fn tup(es: Vec<Hir>) -> Hir {
 }
 pub fn untup(xs: Vec<&'static str>, tup: Hir, body: Hir) -> Hir {
     Hir::Untup(
-        xs.iter().map(|x| Name::global(x)).collect::<Vec<_>>(),
+        xs.iter().map(|x| NameOrRef::Name(Name::global(x))).collect::<Vec<_>>(),
         Box::new(tup),
         Box::new(body),
     )
@@ -209,8 +211,13 @@ impl LowerSt {
     }
 
     fn refv(&mut self, r_in: Reg, r_out: Reg, res: Reg) {
-        self.insts
-            .push(UInst::Binary(Tag::Comb, CombLabel::Ref.into(), res, r_in, r_out));
+        self.insts.push(UInst::Binary(
+            Tag::Comb,
+            CombLabel::Ref.into(),
+            res,
+            r_in,
+            r_out,
+        ));
     }
 
     pub fn lower(defs: Vec<Def>) -> Result<Vec<UnlinkedProgram>> {
@@ -267,15 +274,35 @@ impl LowerSt {
 
     fn scoped<'a, T>(
         &'a mut self,
-        vars: &'a [Name],
+        vars: &'a [NameOrRef],
         f: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<(T, impl Iterator<Item = Vec<Reg>> + 'a)> {
+    ) -> Result<(T, impl Iterator<Item = Result<Reg>> + 'a)> {
         for x in vars.iter() {
-            self.scope.define(x.clone(), vec![]);
+            match x {
+                NameOrRef::Name(x) => self.scope.define(x.clone(), vec![]),
+                NameOrRef::Ref(x_in, x_out) => {
+                    self.scope.define(x_in.clone(), vec![]);
+                    self.scope.define(x_out.clone(), vec![]);
+                }
+            }
         }
         let res = f(self)?;
-        let us = vars.into_iter().map(|x| self.scope.undefine(&x));
-        Ok((res, us))
+        let rs = vars.into_iter().map(|x| match x {
+            NameOrRef::Name(x) => {
+                let us = self.scope.undefine(&x);
+                self.materialize_users(us)
+            }
+            NameOrRef::Ref(x_in, x_out) => {
+                let x_in_us = self.scope.undefine(&x_in);
+                let x_out_us = self.scope.undefine(&x_out);
+                let r_in = self.materialize_users(x_in_us)?;
+                let r_out = self.materialize_users(x_out_us)?;
+                let r_ref = self.gen();
+                self.refv(r_in, r_out, r_ref);
+                Ok(r_ref)
+            }
+        });
+        Ok((res, rs))
     }
 
     fn expr(&mut self, e: Hir, r: Reg) -> Result<()> {
@@ -297,13 +324,12 @@ impl LowerSt {
                 }
             }
             Let(x, v, b) => {
-                let user;
+                let var_reg;
                 {
-                    let vars = &[x];
-                    let (_, mut users) = self.scoped(vars, |c| c.expr(*b, r))?;
-                    user = users.next().unwrap();
+                    let vars = &[NameOrRef::Name(x)];
+                    let (_, mut var_regs) = self.scoped(vars, |c| c.expr(*b, r))?;
+                    var_reg = var_regs.next().unwrap()?;
                 }
-                let var_reg = self.materialize_users(user)?;
                 self.expr(*v, var_reg)?;
             }
             ExtCall(extfn, es) => {
@@ -352,13 +378,14 @@ impl LowerSt {
             }
             Lam(prm, e) => {
                 let prms = &[prm];
-                let (body, mut prm_users) = self.scoped(prms, |c| c.gen_expr(*e))?;
-                let users = prm_users.next().unwrap();
-                debug_assert!(prm_users.next().is_none());
-                drop(prm_users);
-                let x = self.materialize_users(users)?;
-                self.lam(x, body, r);
+                let (body, mut var_regs) = self.scoped(prms, |c| c.gen_expr(*e))?;
+                let var_reg = var_regs.next().unwrap()?;
+                debug_assert!(var_regs.next().is_none());
+                drop(var_regs);
+                self.lam(var_reg, body, r);
             }
+            CurryCall(..) | CurryLam(..) => todo!("Update or delete these"),
+            /*
             CurryCall(f, mut es) => {
                 if es.is_empty() {
                     // Call `f` with a dummy value
@@ -399,6 +426,7 @@ impl LowerSt {
                     self.lam(x, body, r);
                 }
             }
+            */
             If(e0, e1, e2) => {
                 let c = self.gen_expr(*e0)?;
                 let t = self.gen_expr(*e1)?;
@@ -428,18 +456,16 @@ impl LowerSt {
                         "Invalid AST, invalid un-tuple, needs at least two parameters".to_string(),
                     );
                 }
-                let (_, users) = self.scoped(&xs, |c| c.expr(*body, r))?;
-                let mut users = users.collect::<Vec<_>>();
-                let last_user = users.pop().unwrap();
-                let last = self.materialize_users(last_user)?;
-                let untup = users.into_iter().try_rfold(last, |r, us| -> Result<Reg> {
+                let (_, var_regs) = self.scoped(&xs, |c| c.expr(*body, r))?;
+                let mut var_regs = var_regs.collect::<Result<Vec<_>>>()?;
+                let last = var_regs.pop().unwrap();
+                let untup = var_regs.into_iter().try_rfold(last, |r, l| -> Result<Reg> {
                     let res = self.gen();
-                    let l = self.materialize_users(us)?;
                     self.tup(l, r, res);
                     Ok(res)
                 })?;
                 self.expr(*tup, untup)?;
-            },
+            }
             Ref(e0, e1) => {
                 let r_in = self.gen_expr(*e0)?;
                 let r_out = self.gen_expr(*e1)?;

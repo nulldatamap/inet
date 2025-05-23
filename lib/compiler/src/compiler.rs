@@ -4,7 +4,7 @@ use std::result;
 use vm::ext::{ExtTy, Externals};
 
 use crate::ast::*;
-use crate::lowering::Hir;
+use crate::lowering::{Hir, NameOrRef};
 use crate::scope::{Name, Scope};
 
 struct VarEntry {
@@ -563,7 +563,7 @@ impl Compiler {
                 Hir::Tup(vec![
                     Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
                     Hir::Lam(
-                        prms.clone(),
+                        NameOrRef::Name(prms.clone()),
                         Box::new(Hir::Tup(vec![
                             Hir::I32(self.type_system.type_tag(self.type_system.ty(*ret))),
                             Hir::Call(Box::new(n.hir), Box::new(Hir::Var(prms))),
@@ -591,7 +591,7 @@ impl Compiler {
         let box_ty = self.gen("__box_ty");
         let box_val = self.gen("__box_val");
         Hir::Untup(
-            vec![box_ty, box_val.clone()],
+            vec![NameOrRef::Name(box_ty), NameOrRef::Name(box_val.clone())],
             Box::new(v),
             Box::new(Hir::Var(box_val)),
         )
@@ -732,7 +732,10 @@ impl Compiler {
                     // then __box_val ..args
                     // else throw nil ; ERROR
                     Hir::Untup(
-                        vec![head_ty.clone(), head_val.clone()],
+                        vec![
+                            NameOrRef::Name(head_ty.clone()),
+                            NameOrRef::Name(head_val.clone()),
+                        ],
                         Box::new(head),
                         Box::new(Hir::If(
                             Box::new(Hir::ExtCall(
@@ -815,35 +818,41 @@ impl Compiler {
                     hir: body,
                     meta: ret_meta,
                 } = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
-                let (prms_var, body) = if ps.len() == 0 {
-                    (self.gen("__dummy_prm"), body)
-                } else if ps.len() == 1 {
-                    (self.scope.undefine(&ps[0]).name(), body)
-                } else {
-                    let prms_var = self.gen("__prms");
-                    (
-                        prms_var.clone(),
-                        Hir::Untup(
-                            ps.into_iter()
-                                .map(|p| self.scope.undefine(&p).name())
-                                .collect::<Vec<_>>(),
-                            Box::new(Hir::Var(prms_var)),
-                            Box::new(body),
-                        ),
-                    )
-                };
+                let ps = ps
+                    .into_iter()
+                    .map(|p| self.scope.undefine(&p).name())
+                    .collect::<Vec<_>>();
+                let lam = self.make_lam(ps, body);
                 let fn_ty = TypeInfo::Fn(FnType {
                     prms: vec![TypeId::ANY; arity],
                     ret: self.type_system.intern_ty(ret_meta.type_info),
                 });
-                Ok(Node::new(
-                    Hir::Lam(prms_var, Box::new(body)),
-                    Metadata::new(fn_ty, ret_meta.uses_io),
-                ))
+                Ok(Node::new(lam, Metadata::new(fn_ty, ret_meta.uses_io)))
             }
             Expr::Lit(l) => self.lit(l),
             _ => todo!(),
         }
+    }
+
+    fn make_lam(&mut self, mut ps: Vec<Name>, body: Hir) -> Hir {
+        let (prms_var, body) = if ps.len() == 0 {
+            (self.gen("__dummy_prm"), body)
+        } else if ps.len() == 1 {
+            (ps.pop().unwrap(), body)
+        } else {
+            let prms_var = self.gen("__prms");
+            (
+                prms_var.clone(),
+                Hir::Untup(
+                    ps.into_iter()
+                        .map(|p| NameOrRef::Name(p))
+                        .collect::<Vec<_>>(),
+                    Box::new(Hir::Var(prms_var)),
+                    Box::new(body),
+                ),
+            )
+        };
+        Hir::Lam(NameOrRef::Name(prms_var), Box::new(body))
     }
 
     fn truth_of_expr(&mut self, e: Hir, tys: Option<HashSet<UnboxedTypeId>>) -> Result<Hir> {
@@ -866,7 +875,10 @@ impl Compiler {
         // then __box_val
         // else true
         Ok(Hir::Untup(
-            vec![e_ty.clone(), e_val.clone()],
+            vec![
+                NameOrRef::Name(e_ty.clone()),
+                NameOrRef::Name(e_val.clone()),
+            ],
             Box::new(e),
             Box::new(Hir::If(
                 Box::new(Hir::ExtCall(
@@ -898,6 +910,7 @@ impl Compiler {
             })) => {
                 let ext = *extcall_id;
                 let fn_ty = *ty_id;
+
                 let mut names = Vec::new();
                 for _ in 0..*arity {
                     names.push(self.gen("__arg"));
@@ -907,8 +920,10 @@ impl Compiler {
                     .map(|x| Hir::Var(x.clone()))
                     .collect::<Vec<_>>();
 
+                let lam = self.make_lam(names, Hir::ExtCall(ext, args));
+
                 Ok(Node::new(
-                    Hir::CurryLam(names, Box::new(Hir::ExtCall(ext, args))),
+                    lam,
                     Metadata::pure(self.type_system.ty(fn_ty).clone()),
                 ))
             }
@@ -1020,14 +1035,21 @@ mod tests {
         assert_eq!(
             c("@i32add"),
             Ok(Node::new(
-                Hir::CurryLam(
-                    vec![Name::new("__arg", 1), Name::new("__arg", 2)],
-                    Box::new(Hir::ExtCall(
-                        Externals::I32_ADD,
+                Hir::Lam(
+                    NameOrRef::Name(Name::new("__prms", 3)),
+                    Box::new(Hir::Untup(
                         vec![
-                            Hir::Var(Name::new("__arg", 1)),
-                            Hir::Var(Name::new("__arg", 2))
-                        ]
+                            NameOrRef::Name(Name::new("__arg", 1)),
+                            NameOrRef::Name(Name::new("__arg", 2))
+                        ],
+                        Box::new(Hir::Var(Name::new("__prms", 3))),
+                        Box::new(Hir::ExtCall(
+                            Externals::I32_ADD,
+                            vec![
+                                Hir::Var(Name::new("__arg", 1)),
+                                Hir::Var(Name::new("__arg", 2))
+                            ]
+                        ))
                     ))
                 ),
                 Metadata::pure(arith_fn_ty)
@@ -1037,14 +1059,20 @@ mod tests {
         assert_eq!(
             c("(fn [] nil)"),
             Ok(Node::new(
-                Hir::Lam(Name::new("__dummy_prm", 1), Box::new(Hir::Nil)),
+                Hir::Lam(
+                    NameOrRef::Name(Name::new("__dummy_prm", 1)),
+                    Box::new(Hir::Nil)
+                ),
                 Metadata::pure(any0_nil_fn_ty)
             ))
         );
         assert_eq!(
             c("(fn [x] x)"),
             Ok(Node::new(
-                Hir::Lam(Name::new("x", 1), Box::new(Hir::Var(Name::new("x", 1)))),
+                Hir::Lam(
+                    NameOrRef::Name(Name::new("x", 1)),
+                    Box::new(Hir::Var(Name::new("x", 1)))
+                ),
                 Metadata::pure(any1_fn_ty)
             ))
         );
@@ -1052,9 +1080,12 @@ mod tests {
             c("(fn [x y] x)"),
             Ok(Node::new(
                 Hir::Lam(
-                    Name::new("__prms", 3),
+                    NameOrRef::Name(Name::new("__prms", 3)),
                     Box::new(Hir::Untup(
-                        vec![Name::new("x", 1), Name::new("y", 2)],
+                        vec![
+                            NameOrRef::Name(Name::new("x", 1)),
+                            NameOrRef::Name(Name::new("y", 2))
+                        ],
                         Box::new(Hir::Var(Name::new("__prms", 3))),
                         Box::new(Hir::Var(Name::new("x", 1)))
                     ))
@@ -1153,8 +1184,14 @@ mod tests {
                 "(let [x ((if false (fn [] 0) (fn [] (fn [] 7))))] (if x (x) 0))",
                 Ok(ExtVal::i32(7)),
             ),
-            ("(let [f (fn []) diverge! (fn [] (f 0))] (if true (diverge!) 1))", Err(ExtVal::nil())),
-            ("(let [f (fn []) diverge! (fn [] (f 0))] (if false (diverge!) 1))", Ok(ExtVal::i32(1))),
+            (
+                "(let [f (fn []) diverge! (fn [] (f 0))] (if true (diverge!) 1))",
+                Err(ExtVal::nil()),
+            ),
+            (
+                "(let [f (fn []) diverge! (fn [] (f 0))] (if false (diverge!) 1))",
+                Ok(ExtVal::i32(1)),
+            ),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
