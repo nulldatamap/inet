@@ -10,13 +10,22 @@ use crate::scope::Name;
 
 type UInst = UnlinkedInst;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum NameOrRef {
     Name(Name),
     Ref(Name, Name),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl std::fmt::Debug for NameOrRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NameOrRef::Name(n) => write!(f, "{:?}", n),
+            NameOrRef::Ref(n0, n1) => write!(f, "ref({:?}:{:?})", n0, n1),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum Hir {
     Nil,
     I32(i32),
@@ -28,13 +37,62 @@ pub enum Hir {
     Lam(NameOrRef, Box<Hir>),
     CurryCall(Box<Hir>, Vec<Hir>),
     CurryLam(Vec<Name>, Box<Hir>),
-    Ref(Box<Hir>, Box<Hir>),
+    Ref(Box<Hir>, Option<Box<Hir>>),
     Tup(Vec<Hir>),
     Untup(Vec<NameOrRef>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
     Diverge(Box<Hir>),
     Lift(Box<Hir>),
     Lower(Box<Hir>),
+}
+
+impl std::fmt::Debug for Hir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Hir::Nil => f.write_str("nil"),
+            Hir::I32(i) => write!(f, "{}", i),
+            Hir::Var(x) => write!(f, "{:?}", x),
+            Hir::Add(e0, e1) => write!(f, "({:?} + {:?})", e0, e1),
+            Hir::If(e0, e1, e2) => write!(f, "(if {:?} then {:?} else {:?})", e0, e1, e2),
+            Hir::Let(n, e0, e1) => write!(f, "(let {:?} = {:?} in {:?})", n, e0, e1),
+            Hir::Call(e0, e1) => write!(f, "{:?}({:?})", e0, e1),
+            Hir::Lam(n, e) => write!(f, "\\{:?} -> {:?}", n, e),
+            Hir::CurryCall(hir, hirs) => todo!(),
+            Hir::CurryLam(names, hir) => todo!(),
+            Hir::Ref(e0, Some(e1)) => write!(f, "ref({:?} : {:?})", e0, e1),
+            Hir::Ref(e0, None) => write!(f, "ref({:?} : _)", e0),
+            Hir::Tup(es) => write!(
+                f,
+                "({})",
+                es.iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Hir::Untup(xs, e0, e1) => write!(
+                f,
+                "(let ({}) = {:?} in {:?})",
+                xs.iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                e0,
+                e1
+            ),
+            Hir::ExtCall(i, es) => write!(
+                f,
+                "@{}({})",
+                i,
+                es.iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Hir::Diverge(e) => write!(f, "diverge! {:?}", e),
+            Hir::Lift(hir) => todo!(),
+            Hir::Lower(hir) => todo!(),
+        }
+    }
 }
 
 pub fn i(i: i32) -> Hir {
@@ -66,7 +124,9 @@ pub fn tup(es: Vec<Hir>) -> Hir {
 }
 pub fn untup(xs: Vec<&'static str>, tup: Hir, body: Hir) -> Hir {
     Hir::Untup(
-        xs.iter().map(|x| NameOrRef::Name(Name::global(x))).collect::<Vec<_>>(),
+        xs.iter()
+            .map(|x| NameOrRef::Name(Name::global(x)))
+            .collect::<Vec<_>>(),
         Box::new(tup),
         Box::new(body),
     )
@@ -459,16 +519,24 @@ impl LowerSt {
                 let (_, var_regs) = self.scoped(&xs, |c| c.expr(*body, r))?;
                 let mut var_regs = var_regs.collect::<Result<Vec<_>>>()?;
                 let last = var_regs.pop().unwrap();
-                let untup = var_regs.into_iter().try_rfold(last, |r, l| -> Result<Reg> {
-                    let res = self.gen();
-                    self.tup(l, r, res);
-                    Ok(res)
-                })?;
+                let untup = var_regs
+                    .into_iter()
+                    .try_rfold(last, |r, l| -> Result<Reg> {
+                        let res = self.gen();
+                        self.tup(l, r, res);
+                        Ok(res)
+                    })?;
                 self.expr(*tup, untup)?;
             }
-            Ref(e0, e1) => {
+            Ref(e0, me1) => {
                 let r_in = self.gen_expr(*e0)?;
-                let r_out = self.gen_expr(*e1)?;
+                let r_out = if let Some(e1) = me1 {
+                    self.gen_expr(*e1)?
+                } else {
+                    let r = self.gen();
+                    self.erase(r);
+                    r
+                };
                 self.refv(r_in, r_out, r);
             }
             Diverge(e) => {

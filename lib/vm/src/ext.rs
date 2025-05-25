@@ -663,10 +663,24 @@ pub struct Externals {
 
 pub struct IoHandle {
     pub op_count: AtomicUsize,
+    pub on_erase: Option<Box<dyn FnOnce(&IoHandle) + Sync>>
+}
+
+impl IoHandle {
+    pub fn new() -> IoHandle {
+        IoHandle {
+            op_count: 0.into(),
+            on_erase: None,
+        }
+    }
 }
 
 impl Tracked for IoHandle {
-    unsafe fn erase_in_place(&mut self, _exts: &Externals) {}
+    unsafe fn erase_in_place(&mut self, _exts: &Externals) {
+        if let Some(f) = self.on_erase.take() {
+            f(&self);
+        }
+    }
 }
 
 struct ArgsHeader {

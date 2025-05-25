@@ -98,7 +98,7 @@ impl<'h> Globals<'h> {
 
 pub type LinkError = String;
 
-pub fn link_programs<'h>(progs: &[UnlinkedProgram]) -> Result<Globals<'h>, LinkError> {
+pub fn link_programs<'h>(progs: &[&UnlinkedProgram]) -> Result<Globals<'h>, LinkError> {
     // Reserve and pin all the globals up from, so we can create
     // references between programs
     let gs = progs

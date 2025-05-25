@@ -23,7 +23,7 @@ struct BuiltinEntry {
 
 impl BuiltinEntry {
     fn new(name: String, id: u16, fty: FnType, tid: TypeId) -> BuiltinEntry {
-        let io = fty.uses_io();
+        let io = fty.has_io;
         BuiltinEntry {
             name,
             extcall_id: id,
@@ -36,14 +36,16 @@ impl BuiltinEntry {
 }
 
 enum Entry {
-    Var(VarEntry),
+    Global(VarEntry),
+    Local(VarEntry),
     Builtin(BuiltinEntry),
 }
 
 impl Entry {
     fn name(&self) -> Name {
         match self {
-            Entry::Var(VarEntry { name, .. }) => name.clone(),
+            Entry::Global(VarEntry { name, .. }) => name.clone(),
+            Entry::Local(VarEntry { name, .. }) => name.clone(),
             Entry::Builtin(BuiltinEntry { name, .. }) => Name::global(name),
         }
     }
@@ -122,17 +124,34 @@ impl TypeId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FnType {
+    has_io: bool,
     ret: TypeId,
     prms: Vec<TypeId>,
 }
 
 impl FnType {
-    fn new(r: TypeId, ps: Vec<TypeId>) -> FnType {
-        FnType { ret: r, prms: ps }
+    fn new(r: TypeId, ps: Vec<TypeId>, io: bool) -> FnType {
+        FnType {
+            has_io: io,
+            ret: r,
+            prms: ps,
+        }
     }
 
-    fn uses_io(&self) -> bool {
-        self.prms.iter().any(|&prm| prm == TypeSystem::IO_TY)
+    fn pure(r: TypeId, ps: Vec<TypeId>) -> FnType {
+        FnType {
+            has_io: false,
+            ret: r,
+            prms: ps,
+        }
+    }
+
+    fn io(r: TypeId, ps: Vec<TypeId>) -> FnType {
+        FnType {
+            has_io: true,
+            ret: r,
+            prms: ps,
+        }
     }
 }
 
@@ -445,6 +464,7 @@ struct Compiler {
     scope: Scope<String, Entry>,
     type_system: TypeSystem,
     next_name_id: usize,
+    cur_io: Option<Name>,
 }
 
 type CompilerError = String;
@@ -455,6 +475,7 @@ impl Compiler {
         let mut scope: Scope<String, Entry> = Scope::new();
         let mut ts = TypeSystem::new();
         let any_ = ts.any_extty();
+        let nil_ = TypeSystem::NIL_TY;
         let i32_ = TypeSystem::I32_TY;
         let io_ = TypeSystem::IO_TY;
 
@@ -463,12 +484,13 @@ impl Compiler {
             (
                 "@i32add",
                 Externals::I32_ADD,
-                FnType::new(i32_, vec![i32_, i32_]),
+                FnType::pure(i32_, vec![i32_, i32_]),
             ),
             (
                 "@print",
                 Externals::PRINT,
-                FnType::new(io_, vec![io_, any_]),
+                // "pure" because the io is explicit
+                FnType::pure(io_, vec![io_, any_]),
             ),
         ];
         for (n, i, t) in builtins {
@@ -479,15 +501,25 @@ impl Compiler {
             );
         }
 
+        scope.define(
+            "print".to_string(),
+            Entry::Global(VarEntry {
+                name: Name::global("print"),
+                type_info: TypeInfo::Fn(FnType::io(nil_, vec![TypeId::ANY])),
+            }),
+        );
+
         Compiler {
             scope,
             type_system: ts,
             next_name_id: 1,
+            cur_io: None,
         }
     }
 
     fn reset(&mut self) {
         self.next_name_id = 1;
+        self.cur_io = None;
     }
 
     fn gen(&mut self, x: impl ToString) -> Name {
@@ -496,10 +528,22 @@ impl Compiler {
         Name::new(x, i)
     }
 
+    fn next_io_ref(&mut self) -> Hir {
+        let io_out = self.gen("__io");
+        let io_in = self.cur_io.replace(io_out.clone()).expect("no cur_io set");
+        Hir::Ref(Box::new(Hir::Var(io_in)), Some(Box::new(Hir::Var(io_out))))
+    }
+
     pub fn compile(e: Expr) -> Result<Hir> {
         let mut c = Compiler::new();
+        let io_in = c.gen("__io_in");
+        c.cur_io = Some(io_in.clone());
         let boxed_r = c.conv_expr(e, &Metadata::any_io())?;
-        Ok(c.unbox_node(boxed_r))
+        let result = c.unbox_node(boxed_r);
+        let io_out = c.cur_io.take().unwrap();
+        let io_ref = c.gen("__io_ref");
+        let con = Hir::Lam(NameOrRef::Ref(io_in, io_out), Box::new(result));
+        Ok(con)
     }
 
     fn undefined_var<T>(&self, x: &str) -> Result<T> {
@@ -628,7 +672,7 @@ impl Compiler {
                     let b_name = self.gen(b.name.clone());
                     self.scope.define(
                         b.name.clone(),
-                        Entry::Var(VarEntry {
+                        Entry::Local(VarEntry {
                             name: b_name,
                             type_info: TypeInfo::Any,
                         }),
@@ -679,7 +723,7 @@ impl Compiler {
                 } = self.expr(*f)?;
 
                 // TODO: IO sequencing
-                let (mut args, ret_ty) = match &head_meta.type_info {
+                let (mut args, ret_ty, io) = match &head_meta.type_info {
                     // We have a concrete function type?
                     TypeInfo::Fn(fn_ty) => {
                         if fn_ty.prms.len() == es.len() {
@@ -694,6 +738,7 @@ impl Compiler {
                                     })
                                     .collect::<Result<Vec<_>>>()?,
                                 self.type_system.ty(fn_ty.ret).clone(),
+                                fn_ty.has_io
                             )
                         } else {
                             return self.invalid_arity(None, es.len(), fn_ty.prms.len());
@@ -706,6 +751,7 @@ impl Compiler {
                                 .map(|e| self.conv_expr(e, &Metadata::any_io()))
                                 .collect::<Result<Vec<_>>>()?,
                             TypeInfo::Any,
+                            true
                         )
                     }
                     TypeInfo::AnyFn => panic!("ICE: AnyFn in unboxed head position of invoke"),
@@ -713,6 +759,11 @@ impl Compiler {
                         return self.uninvokable_value(&t);
                     }
                 };
+
+                let arity = args.len();
+                if io {
+                    args.insert(0, self.next_io_ref());
+                }
 
                 let arg_count = args.len();
                 let args = if args.len() == 0 {
@@ -742,7 +793,8 @@ impl Compiler {
                                 Externals::EQ,
                                 vec![
                                     Hir::Var(head_ty),
-                                    Hir::I32(self.type_system.any_fn_tag(arg_count)),
+                                    // Use arity and arg_count, since we don't count the io ref
+                                    Hir::I32(self.type_system.any_fn_tag(arity)),
                                 ],
                             )),
                             Box::new(Hir::Call(Box::new(Hir::Var(head_val)), Box::new(args))),
@@ -757,7 +809,7 @@ impl Compiler {
 
                 Ok(Node {
                     hir: result,
-                    meta: Metadata::pure(ret_ty),
+                    meta: Metadata::new(ret_ty, io),
                 })
             }
             Expr::If(e0, e1, e2) => {
@@ -808,7 +860,7 @@ impl Compiler {
                     let name = self.gen(p.clone());
                     self.scope.define(
                         p.clone(),
-                        Entry::Var(VarEntry {
+                        Entry::Local(VarEntry {
                             name,
                             type_info: TypeInfo::Any,
                         }),
@@ -822,11 +874,12 @@ impl Compiler {
                     .into_iter()
                     .map(|p| self.scope.undefine(&p).name())
                     .collect::<Vec<_>>();
-                let lam = self.make_lam(ps, body);
-                let fn_ty = TypeInfo::Fn(FnType {
-                    prms: vec![TypeId::ANY; arity],
-                    ret: self.type_system.intern_ty(ret_meta.type_info),
-                });
+                let lam = self.make_lam(ps, body, ret_meta.uses_io());
+                let fn_ty = TypeInfo::Fn(FnType::new(
+                    self.type_system.intern_ty(ret_meta.type_info),
+                    vec![TypeId::ANY; arity],
+                    ret_meta.uses_io,
+                ));
                 Ok(Node::new(lam, Metadata::new(fn_ty, ret_meta.uses_io)))
             }
             Expr::Lit(l) => self.lit(l),
@@ -834,7 +887,7 @@ impl Compiler {
         }
     }
 
-    fn make_lam(&mut self, mut ps: Vec<Name>, body: Hir) -> Hir {
+    fn make_lam(&mut self, mut ps: Vec<Name>, body: Hir, io: bool) -> Hir {
         let (prms_var, body) = if ps.len() == 0 {
             (self.gen("__dummy_prm"), body)
         } else if ps.len() == 1 {
@@ -896,9 +949,9 @@ impl Compiler {
 
     fn var(&mut self, x: String) -> Result<Node> {
         match self.scope.lookup(&x) {
-            Some(Entry::Var(VarEntry { name, type_info })) => Ok(Node::new(
-                Hir::Var(name.clone()),
-                Metadata::pure(type_info.clone()),
+            Some(Entry::Local(e) | Entry::Global(e)) => Ok(Node::new(
+                Hir::Var(e.name.clone()),
+                Metadata::pure(e.type_info.clone()),
             )),
             // If we're referring to a builtin in non-head position
             // Then wrap it in a lambda: @i32add => (fn [x0 x1] (@i32add x0 xy))
@@ -976,7 +1029,7 @@ mod tests {
     use crate::lowering::*;
     use crate::reader::read;
     use vm::{
-        ext::{ExtTy, ExtVal, Externals},
+        ext::{ExtTy, ExtVal, Externals, IoHandle},
         heap::Heap,
         program::link_programs,
         repr::Port,
@@ -994,14 +1047,14 @@ mod tests {
         let i32md = Metadata::pure(compiler.type_system.i32_ty().clone());
         let nilmd = Metadata::pure(compiler.type_system.nil_ty().clone());
 
-        let arith_fn_ty = TypeInfo::Fn(FnType::new(
+        let arith_fn_ty = TypeInfo::Fn(FnType::pure(
             TypeSystem::I32_TY,
             vec![TypeSystem::I32_TY, TypeSystem::I32_TY],
         ));
 
-        let any0_nil_fn_ty = TypeInfo::Fn(FnType::new(TypeSystem::NIL_TY, vec![]));
-        let any1_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY]));
-        let any2_fn_ty = TypeInfo::Fn(FnType::new(TypeId::ANY, vec![TypeId::ANY, TypeId::ANY]));
+        let any0_nil_fn_ty = TypeInfo::Fn(FnType::pure(TypeSystem::NIL_TY, vec![]));
+        let any1_fn_ty = TypeInfo::Fn(FnType::pure(TypeId::ANY, vec![TypeId::ANY]));
+        let any2_fn_ty = TypeInfo::Fn(FnType::pure(TypeId::ANY, vec![TypeId::ANY, TypeId::ANY]));
 
         let mut c = |src| {
             compiler.reset();
@@ -1139,6 +1192,44 @@ mod tests {
             }
             y
         });
+        // print:
+        //     fn(tup(ref(io_in io_out) x) nil)
+        //     io_out = @print(io_in x)
+        let print_prog = vm::program::UnlinkedProgram {
+            name: "print".to_string(),
+            globals: Vec::new(),
+            reg_count: 7,
+            instructions: {
+                use std::num::NonZero;
+                use vm::program::{Reg, UnlinkedInst::*};
+                use vm::repr::{CombLabel, Port, Tag};
+                [
+                    (Tag::Comb, CombLabel::Fn, 0, 1, 2),
+                    (Tag::Comb, CombLabel::Tup, 1, 3, 4),
+                    (Tag::Comb, CombLabel::Ref, 3, 5, 6),
+                    (Tag::ExtFn, CombLabel::Fn, 6, 5, 4),
+                ]
+                .into_iter()
+                .map(|(t, l, a, b, c)| {
+                    Binary(
+                        t,
+                        l.into(),
+                        if a == 0 {
+                            Reg::ROOT
+                        } else {
+                            Reg::new(NonZero::new(a).unwrap())
+                        },
+                        Reg::new(NonZero::new(b).unwrap()),
+                        Reg::new(NonZero::new(c).unwrap()),
+                    )
+                })
+                .chain([Nilary(
+                    Reg::new(NonZero::new(2).unwrap()),
+                    Port::from_extval(ExtVal::nil()),
+                )])
+                .collect::<Vec<_>>()
+            },
+        };
         let mut rt = Rt::new(&h, exts);
 
         let cases = [
@@ -1192,22 +1283,46 @@ mod tests {
                 "(let [f (fn []) diverge! (fn [] (f 0))] (if false (diverge!) 1))",
                 Ok(ExtVal::i32(1)),
             ),
+            ("(print 3)", Ok(ExtVal::nil())),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
             let case_name = format!("test_case#{}", i);
             println!("=== {}\n{}\n\n", case_name, src);
             let test_body = Compiler::compile(Expr::parse(&read(src).unwrap()).unwrap()).unwrap();
-            println!("{:?}\n\n", test_body);
-            let unlinked_program = LowerSt::lower(vec![Def::new(
-                case_name.clone(),
-                Hir::ExtCall(ext_store_test_result, vec![test_body]),
-            )])
+            let full_test = Hir::Lam(
+                        NameOrRef::Name(Name::new("__io", 99)),
+                        Box::new(Hir::ExtCall(
+                            ext_store_test_result,
+                            vec![Hir::Call(
+                                Box::new(test_body),
+                                Box::new(Hir::Ref(Box::new(Hir::Var(Name::new("__io", 99))), None)),
+                            )],
+                        )),
+                    );
+            println!("{:?}\n\n", full_test);
+            let unlinked_program = LowerSt::lower(vec![
+                // let test io = @store_test_result(<test body>(ref io))
+                Def::new(
+                    case_name.clone(),
+                    full_test,
+                ),
+                Def::new("print".to_string(), Hir::Nil),
+            ])
             .unwrap();
+            let mut unlinked_program = unlinked_program.iter().collect::<Vec<_>>();
+            unlinked_program.push(&print_prog);
             let case_program = link_programs(&unlinked_program[..]).unwrap();
+            let io_handle = ExtVal::cell(
+                Externals::IO_TY,
+                IoHandle {
+                    op_count: 0.into(),
+                    on_erase: None,
+                },
+            );
             rt.link(
                 Port::from_global(case_program.get(&case_name).unwrap()),
-                Port::from_extval(ExtVal::nil()),
+                Port::from_extval(io_handle),
             );
             rt.normalize();
             match (expected_val, get_test_result()) {
