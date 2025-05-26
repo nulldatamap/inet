@@ -528,10 +528,22 @@ impl Compiler {
         Name::new(x, i)
     }
 
+    fn intro_io(&mut self) -> (Option<Name>, Name) {
+        let io_in = self.gen("__io");
+        let prev_io = self.cur_io.replace(io_in.clone());
+        (prev_io, io_in)
+    }
+
+    fn outro_io(&mut self, prev_io: Option<Name>) -> Name {
+        let io_out = self.cur_io.take().unwrap();
+        self.cur_io = prev_io;
+        io_out
+    }
+
     fn next_io_ref(&mut self) -> Hir {
         let io_out = self.gen("__io");
         let io_in = self.cur_io.replace(io_out.clone()).expect("no cur_io set");
-        Hir::Ref(Box::new(Hir::Var(io_in)), Some(Box::new(Hir::Var(io_out))))
+        Hir::Ref(io_in, Some(io_out))
     }
 
     pub fn compile(e: Expr) -> Result<Hir> {
@@ -601,18 +613,40 @@ impl Compiler {
         match &n.meta.type_info {
             // TODO: In theory, we should also just make a version of the function
             //       That returns a box on its own instead of wrapping the function
-            TypeInfo::Fn(FnType { ret, .. }) if !ret.is_box() => {
+            TypeInfo::Fn(FnType { ret, has_io, .. }) if !has_io || !ret.is_box() => {
+                println!("::BOXING: {:?} -> {:?} [IO: {}]", "..", ret, has_io);
                 // (ANY_FN_ARITY#N, (fn [__prms] (RET_TY, (val __prms))))
                 let prms = self.gen("__prms");
+                let tag = if ret.is_box() {
+                    0
+                } else {
+                    self.type_system.type_tag(self.type_system.ty(*ret))
+                };
+                let inner_body = |prms| {
+                    if !ret.is_box() {
+                        Hir::Tup(vec![
+                            Hir::I32(tag),
+                            Hir::Call(Box::new(n.hir), Box::new(Hir::Var(prms))),
+                        ])
+                    } else {
+                        Hir::Call(Box::new(n.hir), Box::new(Hir::Var(prms)))
+                    }
+                };
+                let outer_body = if !has_io {
+                    // let (ref(io:io), __prms') = __prms in <inner body>
+                    let inner_prms = self.gen("__prms");
+                    let io = self.gen("__io");
+                    Hir::Untup(
+                        vec![NameOrRef::Ref(io.clone(), io), NameOrRef::Name(inner_prms.clone())],
+                        Box::new(Hir::Var(prms.clone())),
+                        Box::new(inner_body(inner_prms)),
+                    )
+                } else {
+                    inner_body(prms.clone())
+                };
                 Hir::Tup(vec![
                     Hir::I32(self.type_system.type_tag(&n.meta.type_info)),
-                    Hir::Lam(
-                        NameOrRef::Name(prms.clone()),
-                        Box::new(Hir::Tup(vec![
-                            Hir::I32(self.type_system.type_tag(self.type_system.ty(*ret))),
-                            Hir::Call(Box::new(n.hir), Box::new(Hir::Var(prms))),
-                        ])),
-                    ),
+                    Hir::Lam(NameOrRef::Name(prms), Box::new(outer_body)),
                 ])
             }
             TypeInfo::Any | TypeInfo::Boxed(_) => {
@@ -738,7 +772,7 @@ impl Compiler {
                                     })
                                     .collect::<Result<Vec<_>>>()?,
                                 self.type_system.ty(fn_ty.ret).clone(),
-                                fn_ty.has_io
+                                fn_ty.has_io,
                             )
                         } else {
                             return self.invalid_arity(None, es.len(), fn_ty.prms.len());
@@ -751,7 +785,7 @@ impl Compiler {
                                 .map(|e| self.conv_expr(e, &Metadata::any_io()))
                                 .collect::<Result<Vec<_>>>()?,
                             TypeInfo::Any,
-                            true
+                            true,
                         )
                     }
                     TypeInfo::AnyFn => panic!("ICE: AnyFn in unboxed head position of invoke"),
@@ -851,10 +885,34 @@ impl Compiler {
                 })
             }
             Expr::Do(mut es) => {
-                // TODO: IO Sequencing
-                self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))
+                let mut vs = Vec::new();
+                let mut io = false;
+                let last = es.pop();
+                for e in es {
+                    let Node { hir, meta } = self.expr(e)?;
+                    // If the value is not last and doesn't have a side effect, discard it
+                    if meta.uses_io {
+                        io = true;
+                        vs.push(hir);
+                    }
+                }
+
+                if let Some(last) = last {
+                    let Node { hir, meta } = self.expr(last)?;
+                    io |= meta.uses_io;
+                    if vs.len() == 0 {
+                        Ok(Node::new(hir, meta))
+                    } else {
+                        vs.push(hir);
+                        Ok(Node::new(Hir::Do(vs), Metadata::new(meta.type_info, io)))
+                    }
+                } else {
+                    Ok(Node::new(Hir::Nil, Metadata::pure(self.type_system.nil_ty().clone())))
+                }
+
             }
             Expr::Fn(ps, mut es) => {
+                let (outer_io, lam_in_io) = self.intro_io();
                 let arity = ps.len();
                 for p in &ps {
                     let name = self.gen(p.clone());
@@ -867,14 +925,23 @@ impl Compiler {
                     );
                 }
                 let Node {
-                    hir: body,
+                    hir: mut body,
                     meta: ret_meta,
                 } = self.expr(es.pop().unwrap_or(Expr::Lit(Literal::Nil)))?;
                 let ps = ps
                     .into_iter()
                     .map(|p| self.scope.undefine(&p).name())
                     .collect::<Vec<_>>();
-                let lam = self.make_lam(ps, body, ret_meta.uses_io());
+                let lam_out_io = self.outro_io(outer_io);
+                debug_assert!(ret_meta.uses_io == (lam_out_io != lam_in_io));
+
+                let io_ref = if !ret_meta.uses_io {
+                    None
+                } else {
+                    Some(NameOrRef::Ref(lam_in_io, lam_out_io))
+                };
+
+                let lam = self.make_lam(ps, body, io_ref);
                 let fn_ty = TypeInfo::Fn(FnType::new(
                     self.type_system.intern_ty(ret_meta.type_info),
                     vec![TypeId::ANY; arity],
@@ -887,25 +954,26 @@ impl Compiler {
         }
     }
 
-    fn make_lam(&mut self, mut ps: Vec<Name>, body: Hir, io: bool) -> Hir {
-        let (prms_var, body) = if ps.len() == 0 {
-            (self.gen("__dummy_prm"), body)
-        } else if ps.len() == 1 {
-            (ps.pop().unwrap(), body)
+    fn make_lam(&mut self, ps: Vec<Name>, body: Hir, io_ref: Option<NameOrRef>) -> Hir {
+        let mut prms = Vec::new();
+        if let Some(io_ref) = io_ref {
+            prms.push(io_ref);
+        } else {
+            debug_assert!(io_ref.is_none());
+        }
+        prms.extend(ps.into_iter().map(|p| NameOrRef::Name(p)));
+        let (prms_var, body) = if prms.len() == 0 {
+            (NameOrRef::Name(self.gen("__dummy_prm")), body)
+        } else if prms.len() == 1 {
+            (prms.pop().unwrap(), body)
         } else {
             let prms_var = self.gen("__prms");
             (
-                prms_var.clone(),
-                Hir::Untup(
-                    ps.into_iter()
-                        .map(|p| NameOrRef::Name(p))
-                        .collect::<Vec<_>>(),
-                    Box::new(Hir::Var(prms_var)),
-                    Box::new(body),
-                ),
+                NameOrRef::Name(prms_var.clone()),
+                Hir::Untup(prms, Box::new(Hir::Var(prms_var)), Box::new(body)),
             )
         };
-        Hir::Lam(NameOrRef::Name(prms_var), Box::new(body))
+        Hir::Lam(prms_var, Box::new(body))
     }
 
     fn truth_of_expr(&mut self, e: Hir, tys: Option<HashSet<UnboxedTypeId>>) -> Result<Hir> {
@@ -973,7 +1041,7 @@ impl Compiler {
                     .map(|x| Hir::Var(x.clone()))
                     .collect::<Vec<_>>();
 
-                let lam = self.make_lam(names, Hir::ExtCall(ext, args));
+                let lam = self.make_lam(names, Hir::ExtCall(ext, args), None);
 
                 Ok(Node::new(
                     lam,
@@ -1022,7 +1090,7 @@ impl Compiler {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroUsize, sync::Mutex};
+    use std::{num::NonZeroUsize, sync::{atomic::Ordering, Mutex}};
 
     use super::*;
     use crate::ast::Expr;
@@ -1113,7 +1181,7 @@ mod tests {
             c("(fn [] nil)"),
             Ok(Node::new(
                 Hir::Lam(
-                    NameOrRef::Name(Name::new("__dummy_prm", 1)),
+                    NameOrRef::Name(Name::new("__dummy_prm", 2)),
                     Box::new(Hir::Nil)
                 ),
                 Metadata::pure(any0_nil_fn_ty)
@@ -1123,8 +1191,8 @@ mod tests {
             c("(fn [x] x)"),
             Ok(Node::new(
                 Hir::Lam(
-                    NameOrRef::Name(Name::new("x", 1)),
-                    Box::new(Hir::Var(Name::new("x", 1)))
+                    NameOrRef::Name(Name::new("x", 2)),
+                    Box::new(Hir::Var(Name::new("x", 2)))
                 ),
                 Metadata::pure(any1_fn_ty)
             ))
@@ -1133,14 +1201,14 @@ mod tests {
             c("(fn [x y] x)"),
             Ok(Node::new(
                 Hir::Lam(
-                    NameOrRef::Name(Name::new("__prms", 3)),
+                    NameOrRef::Name(Name::new("__prms", 4)),
                     Box::new(Hir::Untup(
                         vec![
-                            NameOrRef::Name(Name::new("x", 1)),
-                            NameOrRef::Name(Name::new("y", 2))
+                            NameOrRef::Name(Name::new("x", 2)),
+                            NameOrRef::Name(Name::new("y", 3))
                         ],
-                        Box::new(Hir::Var(Name::new("__prms", 3))),
-                        Box::new(Hir::Var(Name::new("x", 1)))
+                        Box::new(Hir::Var(Name::new("__prms", 4))),
+                        Box::new(Hir::Var(Name::new("x", 2)))
                     ))
                 ),
                 Metadata::pure(any2_fn_ty)
@@ -1154,6 +1222,7 @@ mod tests {
         struct TestResult {
             result: Option<ExtVal<'static>>,
             diverged: Option<ExtVal<'static>>,
+            io_ops: usize,
         }
 
         impl TestResult {
@@ -1161,6 +1230,7 @@ mod tests {
                 TestResult {
                     result: None,
                     diverged: None,
+                    io_ops: 0,
                 }
             }
         }
@@ -1169,8 +1239,9 @@ mod tests {
 
         fn get_test_result() -> result::Result<ExtVal<'static>, ExtVal<'static>> {
             let mut result = TEST_RESULT.lock().unwrap();
-            let TestResult { result, diverged } =
+            let TestResult { result, diverged, io_ops } =
                 std::mem::replace(&mut *result, TestResult::new());
+            println!("IO ops: {}", io_ops);
             match (result, diverged) {
                 (Some(_), Some(_)) => panic!("Test both had a result and diverged(??)"),
                 // TODO: (None, None) => panic!("Test both had no result, but didn't diverge(??)"),
@@ -1178,6 +1249,11 @@ mod tests {
                 (Some(x), _) => Ok(x),
                 (_, Some(x)) => Err(x),
             }
+        }
+
+        fn submit_io_ops(io: &IoHandle) {
+            let mut result = TEST_RESULT.lock().unwrap();
+            result.io_ops = io.op_count.load(Ordering::Relaxed);
         }
 
         let h = Heap::new(NonZeroUsize::new(4096).unwrap());
@@ -1207,7 +1283,7 @@ mod tests {
                     (Tag::Comb, CombLabel::Fn, 0, 1, 2),
                     (Tag::Comb, CombLabel::Tup, 1, 3, 4),
                     (Tag::Comb, CombLabel::Ref, 3, 5, 6),
-                    (Tag::ExtFn, CombLabel::Fn, 6, 5, 4),
+                    (Tag::ExtFn, Externals::PRINT.into(), 5, 4, 6),
                 ]
                 .into_iter()
                 .map(|(t, l, a, b, c)| {
@@ -1284,29 +1360,28 @@ mod tests {
                 Ok(ExtVal::i32(1)),
             ),
             ("(print 3)", Ok(ExtVal::nil())),
+            ("(do (print 3))", Ok(ExtVal::nil())),
+            ("(do (print 1) (print 3))", Ok(ExtVal::nil())),
         ];
 
         for (i, (src, expected_val)) in cases.into_iter().enumerate() {
             let case_name = format!("test_case#{}", i);
             println!("=== {}\n{}\n\n", case_name, src);
             let test_body = Compiler::compile(Expr::parse(&read(src).unwrap()).unwrap()).unwrap();
-            let full_test = Hir::Lam(
-                        NameOrRef::Name(Name::new("__io", 99)),
-                        Box::new(Hir::ExtCall(
-                            ext_store_test_result,
-                            vec![Hir::Call(
-                                Box::new(test_body),
-                                Box::new(Hir::Ref(Box::new(Hir::Var(Name::new("__io", 99))), None)),
-                            )],
-                        )),
-                    );
+            let full_test = Hir::Con(
+                Name::new("__io", 99),
+                Box::new(Hir::ExtCall(
+                    ext_store_test_result,
+                    vec![Hir::Call(
+                        Box::new(test_body),
+                        Box::new(Hir::Ref(Name::new("__io", 99), None)),
+                    )],
+                )),
+            );
             println!("{:?}\n\n", full_test);
             let unlinked_program = LowerSt::lower(vec![
                 // let test io = @store_test_result(<test body>(ref io))
-                Def::new(
-                    case_name.clone(),
-                    full_test,
-                ),
+                Def::new(case_name.clone(), full_test),
                 Def::new("print".to_string(), Hir::Nil),
             ])
             .unwrap();
@@ -1317,7 +1392,7 @@ mod tests {
                 Externals::IO_TY,
                 IoHandle {
                     op_count: 0.into(),
-                    on_erase: None,
+                    on_erase: Some(Box::new(submit_io_ops)),
                 },
             );
             rt.link(

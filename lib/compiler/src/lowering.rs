@@ -1,4 +1,7 @@
-use std::{collections::HashSet, num::NonZeroUsize};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    num::NonZeroUsize,
+};
 
 use vm::{
     ext::{ExtVal, Externals},
@@ -35,13 +38,15 @@ pub enum Hir {
     Let(Name, Box<Hir>, Box<Hir>),
     Call(Box<Hir>, Box<Hir>),
     Lam(NameOrRef, Box<Hir>),
+    Con(Name, Box<Hir>),
     CurryCall(Box<Hir>, Vec<Hir>),
     CurryLam(Vec<Name>, Box<Hir>),
-    Ref(Box<Hir>, Option<Box<Hir>>),
+    Ref(Name, Option<Name>),
     Tup(Vec<Hir>),
     Untup(Vec<NameOrRef>, Box<Hir>, Box<Hir>),
     ExtCall(u16, Vec<Hir>),
     Diverge(Box<Hir>),
+    Do(Vec<Hir>),
     Lift(Box<Hir>),
     Lower(Box<Hir>),
 }
@@ -56,7 +61,8 @@ impl std::fmt::Debug for Hir {
             Hir::If(e0, e1, e2) => write!(f, "(if {:?} then {:?} else {:?})", e0, e1, e2),
             Hir::Let(n, e0, e1) => write!(f, "(let {:?} = {:?} in {:?})", n, e0, e1),
             Hir::Call(e0, e1) => write!(f, "{:?}({:?})", e0, e1),
-            Hir::Lam(n, e) => write!(f, "\\{:?} -> {:?}", n, e),
+            Hir::Lam(n, e) => write!(f, "(\\{:?} -> {:?})", n, e),
+            Hir::Con(n, e) => write!(f, "(\\{:?}* -> {:?})", n, e),
             Hir::CurryCall(hir, hirs) => todo!(),
             Hir::CurryLam(names, hir) => todo!(),
             Hir::Ref(e0, Some(e1)) => write!(f, "ref({:?} : {:?})", e0, e1),
@@ -89,6 +95,14 @@ impl std::fmt::Debug for Hir {
                     .join(", "),
             ),
             Hir::Diverge(e) => write!(f, "diverge! {:?}", e),
+            Hir::Do(es) => write!(
+                f,
+                "(do {})",
+                es.iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
             Hir::Lift(hir) => todo!(),
             Hir::Lower(hir) => todo!(),
         }
@@ -160,6 +174,7 @@ pub struct LowerSt {
     globals_refs: Vec<Name>,
     insts: Vec<UnlinkedInst>,
     scope: Scope,
+    refs: HashMap<Name, Option<Reg>>,
 }
 
 type LoweringError = String;
@@ -174,6 +189,7 @@ impl LowerSt {
             globals_refs: Vec::new(),
             insts: Vec::new(),
             scope: Scope::new(),
+            refs: HashMap::new(),
         }
     }
 
@@ -181,6 +197,20 @@ impl LowerSt {
         let r = Reg::new(self.next_reg);
         self.next_reg = self.next_reg.checked_add(1).expect("Register overflow");
         r
+    }
+
+    fn get_ref(&mut self, x: Name) -> Result<Reg> {
+        if let Some(v) = self.refs.get_mut(&x) {
+            if let Some(r) = v.take() {
+                Ok(r)
+            } else {
+                return Err(format!("Ref `{}` used multiple times!", x));
+            }
+        } else {
+            let r = self.gen();
+            self.refs.insert(x, Some(r));
+            Ok(r)
+        }
     }
 
     fn nil(&mut self, r: Reg) {
@@ -301,6 +331,11 @@ impl LowerSt {
         self.next_reg = NonZeroUsize::new(1).unwrap();
         self.scope.leave();
         debug_assert!(self.scope.is_empty());
+        for (k, v) in self.refs.drain() {
+            if let Some(v) = v {
+                return Err(format!("Ref `{:?}`:{} wasn't used", v, k));
+            }
+        }
         Ok(prog)
     }
 
@@ -340,10 +375,7 @@ impl LowerSt {
         for x in vars.iter() {
             match x {
                 NameOrRef::Name(x) => self.scope.define(x.clone(), vec![]),
-                NameOrRef::Ref(x_in, x_out) => {
-                    self.scope.define(x_in.clone(), vec![]);
-                    self.scope.define(x_out.clone(), vec![]);
-                }
+                _ => {}
             }
         }
         let res = f(self)?;
@@ -353,11 +385,9 @@ impl LowerSt {
                 self.materialize_users(us)
             }
             NameOrRef::Ref(x_in, x_out) => {
-                let x_in_us = self.scope.undefine(&x_in);
-                let x_out_us = self.scope.undefine(&x_out);
-                let r_in = self.materialize_users(x_in_us)?;
-                let r_out = self.materialize_users(x_out_us)?;
                 let r_ref = self.gen();
+                let r_in = self.get_ref(x_in.clone())?;
+                let r_out = self.get_ref(x_out.clone())?;
                 self.refv(r_in, r_out, r_ref);
                 Ok(r_ref)
             }
@@ -444,6 +474,11 @@ impl LowerSt {
                 drop(var_regs);
                 self.lam(var_reg, body, r);
             }
+            Con(x, e) => {
+                let r_ref = self.get_ref(x)?;
+                let body = self.gen_expr(*e)?;
+                self.lam(r_ref, body, r);
+            }
             CurryCall(..) | CurryLam(..) => todo!("Update or delete these"),
             /*
             CurryCall(f, mut es) => {
@@ -528,13 +563,14 @@ impl LowerSt {
                     })?;
                 self.expr(*tup, untup)?;
             }
-            Ref(e0, me1) => {
-                let r_in = self.gen_expr(*e0)?;
-                let r_out = if let Some(e1) = me1 {
-                    self.gen_expr(*e1)?
+            Ref(x_in, x_out) => {
+                let r_in = self.get_ref(x_in)?;
+                let r_out = if let Some(x_out) = x_out {
+                    self.get_ref(x_out)?
                 } else {
                     let r = self.gen();
-                    self.erase(r);
+                    // self.erase(r);
+                    self.nil(r);
                     r
                 };
                 self.refv(r_in, r_out, r);
@@ -543,6 +579,17 @@ impl LowerSt {
                 let r_div = self.gen_expr(*e)?;
                 self.nil(r_div);
                 self.erase(r);
+            }
+            Do(mut es) => {
+                if let Some(last) = es.pop() {
+                    for e in es {
+                        let res = self.gen_expr(e)?;
+                        self.nil(res);
+                    }
+                    self.expr(last, r)?;
+                } else {
+                    self.nil(r);
+                }
             }
             Lift(expr) => todo!(),
             Lower(expr) => todo!(),

@@ -117,10 +117,12 @@ impl<'h> Rt<'h> {
         loop {
             while let Some((a, b)) = self.active_fast.pop() {
                 self.interact(a, b);
+                // println!("{:?}", self);
             }
 
             if let Some((a, b)) = self.active_slow.pop() {
                 self.interact(a, b);
+                // println!("{:?}", self);
             } else {
                 break;
             }
